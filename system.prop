@@ -3,10 +3,11 @@ wifi.interface=wlan0
 ap.interface=wlan0
 persist.tegra.nvmmlite = 1
 persist.wlan.ti.calibrated = 0
+ro.sf.override_null_lcd_density = 0
 ro.sf.lcd_density=320
 
 # fix 14.1 random crashes
-persist.tegra.compositor=surfaceflinger
+persist.tegra.compositor=glcomposer
 
 ro.input.noresample=1
 ro.com.google.clientidbase=android-nvidia
