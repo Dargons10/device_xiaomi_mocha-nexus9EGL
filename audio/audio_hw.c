@@ -1,10 +1,5 @@
 /*
- * Copyright (C) 2014 Cirrus Logic, Inc.
- * Copyright (C) 2012-14 Wolfson Microelectronics plc
- *
- * This code is heavily based on AOSP HAL for the asus/grouper
- *
- * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (C) 2013 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,360 +14,2585 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "tinyhal"
+#define LOG_TAG "audio_hw_primary"
 /*#define LOG_NDEBUG 0*/
+/*#define VERY_VERY_VERBOSE_LOGGING*/
+#ifdef VERY_VERY_VERBOSE_LOGGING
+#define ALOGVV ALOGV
+#else
+#define ALOGVV(a...) do { } while(0)
+#endif
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <sys/time.h>
+#include <stdlib.h>
+#include <math.h>
+#include <dlfcn.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
 
 #include <cutils/log.h>
-#include <cutils/properties.h>
 #include <cutils/str_parms.h>
+#include <cutils/atomic.h>
+#include <cutils/sched_policy.h>
+#include <cutils/properties.h>
 
-#include <utils/Timers.h>
+#include <hardware/audio_effect.h>
+#include <system/thread_defs.h>
+#include <audio_effects/effect_aec.h>
+#include <audio_effects/effect_ns.h>
+#include "audio_hw.h"
 
-#include <hardware/audio.h>
-#include <hardware/hardware.h>
+#include "sound/compress_params.h"
 
-#include <system/audio.h>
+#define MIXER_CTL_COMPRESS_PLAYBACK_VOLUME "Compress Playback Volume"
+#define MIXER_CTL_HEADPHONE_JACK_SWITCH "Headphone Jack Switch"
+#define MIXER_CTL_CODEC_VMIXER_CODEC_SWITCH "Codec VMixer Codec Switch"
+#define MIXER_CTL_SPK_VMIXER_SPK_SWITCH "SPK VMixer SPK Switch"
 
-#include <tinyalsa/asoundlib.h>
-#include <sound/compress_params.h>
-#include <sound/compress_offload.h>
-#include <tinycompress/tinycompress.h>
-
-#include <audio_utils/resampler.h>
-
-#include <tinyhal/audio_config.h>
-
-#include <math.h>
-
-/* Kit Kit doesn't change the HAL API version despite the API changing to
- * add compress support. Use an alternative way of ensuring we can still
- * build against Jellybean without the compress playback support
- */
-#ifdef AUDIO_OFFLOAD_CODEC_PARAMS
-#define TINYHAL_COMPRESS_PLAYBACK
-#endif
-
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-#include <libunshorten/unshorten.h>
-#endif
-
-/* These values are defined in _frames_ (not bytes) to match the ALSA API */
-#define OUT_PERIOD_SIZE_DEFAULT 256
-#define OUT_PERIOD_COUNT_DEFAULT 4
-#define OUT_CHANNEL_MASK_DEFAULT AUDIO_CHANNEL_OUT_STEREO
-#define OUT_CHANNEL_COUNT_DEFAULT 2
-#define OUT_RATE_DEFAULT 44100
-
-#define IN_PERIOD_SIZE_DEFAULT 256
-#define IN_PERIOD_COUNT_DEFAULT 4
-#define IN_CHANNEL_MASK_DEFAULT AUDIO_CHANNEL_IN_MONO
-#define IN_CHANNEL_COUNT_DEFAULT 1
-#define IN_RATE_DEFAULT 44100
-
-/* AudioFlinger does not re-read the buffer size after
- * issuing a routing or input_source change so the
- * default buffer size must be suitable for both PCM
- * and compressed inputs
- */
-#define IN_COMPRESS_BUFFER_SIZE_DEFAULT 1024
-
-/* Maximum time we'll wait for data from a compress_pcm input */
-#define MAX_COMPRESS_PCM_TIMEOUT_MS     2100
-
-/* How long compress_write() will wait for driver to signal a poll()
- * before giving up. Set to -1 to make it wait indefinitely
- */
-#define MAX_COMPRESS_POLL_WAIT_MS   -1
-
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-enum async_mode {
-    ASYNC_NONE,
-    ASYNC_POLL,
-    ASYNC_EARLY_DRAIN,
-    ASYNC_FULL_DRAIN
+/* TODO: the following PCM device profiles could be read from a config file */
+static struct pcm_device_profile pcm_device_playback = {
+    .config = {
+        .channels = PLAYBACK_DEFAULT_CHANNEL_COUNT,
+        .rate = PLAYBACK_DEFAULT_SAMPLING_RATE,
+        .period_size = PLAYBACK_PERIOD_SIZE,
+        .period_count = PLAYBACK_PERIOD_COUNT,
+        .format = PCM_FORMAT_S16_LE,
+        .start_threshold = PLAYBACK_START_THRESHOLD(PLAYBACK_PERIOD_SIZE, PLAYBACK_PERIOD_COUNT),
+        .stop_threshold = PLAYBACK_STOP_THRESHOLD(PLAYBACK_PERIOD_SIZE, PLAYBACK_PERIOD_COUNT),
+        .silence_threshold = 0,
+        .silence_size = UINT_MAX,
+        .avail_min = PLAYBACK_AVAILABLE_MIN,
+    },
+    .card = SOUND_CARD,
+    .id = 9,
+    .type = PCM_PLAYBACK,
+    .devices = AUDIO_DEVICE_OUT_WIRED_HEADSET|AUDIO_DEVICE_OUT_WIRED_HEADPHONE|
+               AUDIO_DEVICE_OUT_SPEAKER,
 };
 
-typedef void* (*async_common_fn_t)( void* arg );
-
-typedef struct {
-    bool                    exit;
-    pthread_cond_t          cv;
-    const struct audio_stream_out* stream;
-    stream_callback_t       callback;
-    void*                   callback_param;
-    pthread_mutex_t         mutex;
-    pthread_t               thread;
-    enum async_mode         mode;
-} async_common_t;
-#endif /* TINYHAL_COMPRESS_PLAYBACK */
-
-/* Voice trigger and voice recognition stream names */
-const char kVoiceTriggerStreamName[] = "voice trigger";
-const char kVoiceRecogStreamName[] = "voice recognition";
-
-/* States for voice trigger / voice recognition state machine */
-enum voice_state {
-    eVoiceNone,             /* no voice recognition hardware */
-    eVoiceTriggerIdle,      /* Trigger-only mode idle */
-    eVoiceTriggerArmed,     /* Trigger-only mode armed */
-    eVoiceTriggerFired,     /* Trigger-only mode received trigger */
-    eVoiceRecogIdle,        /* Full trigger+audio mode idle */
-    eVoiceRecogArmed,       /* Full trigger+audio mode armed */
-    eVoiceRecogFired,       /* Full trigger+audio mode received trigger */
-    eVoiceRecogAudio,       /* Full trigger+audio mode opened for audio */
-    eVoiceRecogReArm        /* Re-arm after audio */
+static struct pcm_device_profile pcm_device_capture = {
+    .config = {
+        .channels = CAPTURE_DEFAULT_CHANNEL_COUNT,
+        .rate = CAPTURE_DEFAULT_SAMPLING_RATE,
+        .period_size = CAPTURE_PERIOD_SIZE,
+        .period_count = CAPTURE_PERIOD_COUNT,
+        .format = PCM_FORMAT_S16_LE,
+        .start_threshold = CAPTURE_START_THRESHOLD,
+        .stop_threshold = 0,
+        .silence_threshold = 0,
+        .avail_min = 0,
+    },
+    .card = SOUND_CARD,
+    .id = 0,
+    .type = PCM_CAPTURE,
+    .devices = AUDIO_DEVICE_IN_BUILTIN_MIC|AUDIO_DEVICE_IN_WIRED_HEADSET|AUDIO_DEVICE_IN_BACK_MIC,
 };
 
-struct audio_device {
-    struct audio_hw_device hw_device;
+static struct pcm_device_profile pcm_device_capture_low_latency = {
+    .config = {
+        .channels = CAPTURE_DEFAULT_CHANNEL_COUNT,
+        .rate = CAPTURE_DEFAULT_SAMPLING_RATE,
+        .period_size = CAPTURE_PERIOD_SIZE_LOW_LATENCY,
+        .period_count = CAPTURE_PERIOD_COUNT_LOW_LATENCY,
+        .format = PCM_FORMAT_S16_LE,
+        .start_threshold = CAPTURE_START_THRESHOLD,
+        .stop_threshold = 0,
+        .silence_threshold = 0,
+        .avail_min = 0,
+    },
+    .card = SOUND_CARD,
+    .id = 0,
+    .type = PCM_CAPTURE_LOW_LATENCY,
+    .devices = AUDIO_DEVICE_IN_BUILTIN_MIC|AUDIO_DEVICE_IN_WIRED_HEADSET|AUDIO_DEVICE_IN_BACK_MIC,
+};
 
-    pthread_mutex_t lock;
-    bool mic_mute;
-    struct config_mgr *cm;
+static struct pcm_device_profile pcm_device_capture_loopback_aec = {
+    .config = {
+        .channels = CAPTURE_DEFAULT_CHANNEL_COUNT,
+        .rate = CAPTURE_DEFAULT_SAMPLING_RATE,
+        .period_size = CAPTURE_PERIOD_SIZE,
+        .period_count = CAPTURE_PERIOD_COUNT,
+        .format = PCM_FORMAT_S16_LE,
+        .start_threshold = CAPTURE_START_THRESHOLD,
+        .stop_threshold = 0,
+        .silence_threshold = 0,
+        .avail_min = 0,
+    },
+    .card = SOUND_CARD,
+    .id = 1,
+    .type = PCM_CAPTURE,
+    .devices = SND_DEVICE_IN_LOOPBACK_AEC,
+};
 
-    struct stream_in_pcm *active_voice_control;
+static struct pcm_device_profile pcm_device_playback_sco = {
+    .config = {
+        .channels = SCO_DEFAULT_CHANNEL_COUNT,
+        .rate = SCO_DEFAULT_SAMPLING_RATE,
+        .period_size = SCO_PERIOD_SIZE,
+        .period_count = SCO_PERIOD_COUNT,
+        .format = PCM_FORMAT_S16_LE,
+        .start_threshold = SCO_START_THRESHOLD,
+        .stop_threshold = SCO_STOP_THRESHOLD,
+        .silence_threshold = 0,
+        .avail_min = SCO_AVAILABLE_MIN,
+    },
+    .card = SOUND_CARD,
+    .id = 2,
+    .type = PCM_PLAYBACK,
+    .devices =
+            AUDIO_DEVICE_OUT_BLUETOOTH_SCO|AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET|
+            AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT,
+};
 
-    enum voice_state voice_st;
-    audio_devices_t voice_trig_mic;
+static struct pcm_device_profile pcm_device_capture_sco = {
+    .config = {
+        .channels = SCO_DEFAULT_CHANNEL_COUNT,
+        .rate = SCO_DEFAULT_SAMPLING_RATE,
+        .period_size = SCO_PERIOD_SIZE,
+        .period_count = SCO_PERIOD_COUNT,
+        .format = PCM_FORMAT_S16_LE,
+        .start_threshold = CAPTURE_START_THRESHOLD,
+        .stop_threshold = 0,
+        .silence_threshold = 0,
+        .avail_min = 0,
+    },
+    .card = SOUND_CARD,
+    .id = 2,
+    .type = PCM_CAPTURE,
+    .devices = AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET,
+};
 
-    const struct hw_stream* global_stream;
+static struct pcm_device_profile pcm_device_hotword_streaming = {
+    .config = {
+        .channels = 1,
+        .rate = 16000,
+        .period_size = CAPTURE_PERIOD_SIZE,
+        .period_count = CAPTURE_PERIOD_COUNT,
+        .format = PCM_FORMAT_S16_LE,
+        .start_threshold = CAPTURE_START_THRESHOLD,
+        .stop_threshold = 0,
+        .silence_threshold = 0,
+        .avail_min = 0,
+    },
+    .card = SOUND_CARD,
+    .id = 0,
+    .type = PCM_HOTWORD_STREAMING,
+    .devices = AUDIO_DEVICE_IN_BUILTIN_MIC|AUDIO_DEVICE_IN_WIRED_HEADSET|AUDIO_DEVICE_IN_BACK_MIC
+};
 
-    union {
-        /* config stream for trigger-only operation */
-        const struct hw_stream* voice_trig_stream;
+static struct pcm_device_profile * const pcm_devices[] = {
+    &pcm_device_playback,
+    &pcm_device_capture,
+    &pcm_device_capture_low_latency,
+    &pcm_device_playback_sco,
+    &pcm_device_capture_sco,
+    &pcm_device_capture_loopback_aec,
+    &pcm_device_hotword_streaming,
+    NULL,
+};
 
-        /* config stream for trigger+voice operation */
-        const struct hw_stream* voice_recog_stream;
-    };
+static const char * const use_case_table[AUDIO_USECASE_MAX] = {
+    [USECASE_AUDIO_PLAYBACK] = "playback",
+    [USECASE_AUDIO_PLAYBACK_MULTI_CH] = "playback multi-channel",
+    [USECASE_AUDIO_PLAYBACK_OFFLOAD] = "compress-offload-playback",
+    [USECASE_AUDIO_CAPTURE] = "capture",
+    [USECASE_AUDIO_CAPTURE_HOTWORD] = "capture-hotword",
+    [USECASE_VOICE_CALL] = "voice-call",
 };
 
 
-typedef void(*out_close_fn)(struct audio_stream_out *);
+#define STRING_TO_ENUM(string) { #string, string }
 
-/* Fields common to all types of output stream */
-struct stream_out_common {
-    struct audio_stream_out stream;
+static unsigned int audio_device_ref_count;
 
-    out_close_fn    close;
-    struct audio_device *dev;
-    const struct hw_stream* hw;
-
-    pthread_mutex_t lock;
-
-    bool standby;
-
-    /* Stream parameters as seen by AudioFlinger
-     * If stream is resampling AudioFlinger buffers before
-     * passing them to hardware, these members refer to the
-     * _input_ data from AudioFlinger
-     */
-    audio_format_t format;
-    uint32_t channel_mask;
-    int channel_count;
-    uint32_t sample_rate;
-    size_t frame_size;
-    uint32_t buffer_size;
-
-    uint32_t latency;
-
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-    bool use_async;
-    async_common_t async_common;
-#endif
+static struct pcm_config pcm_config_deep_buffer = {
+    .channels = 2,
+    .rate = DEEP_BUFFER_OUTPUT_SAMPLING_RATE,
+    .period_size = DEEP_BUFFER_OUTPUT_PERIOD_SIZE,
+    .period_count = DEEP_BUFFER_OUTPUT_PERIOD_COUNT,
+    .format = PCM_FORMAT_S16_LE,
+    .start_threshold = DEEP_BUFFER_OUTPUT_PERIOD_SIZE / 4,
+    .stop_threshold = INT_MAX,
+    .avail_min = DEEP_BUFFER_OUTPUT_PERIOD_SIZE / 4,
 };
 
-struct stream_out_pcm {
-    struct stream_out_common common;
-
-    struct pcm *pcm;
-
-    uint32_t hw_sample_rate;    /* actual sample rate of hardware */
-    int hw_channel_count;  /* actual number of output channels */
+struct string_to_enum {
+    const char *name;
+    uint32_t value;
 };
 
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-struct stream_out_compress {
-    struct stream_out_common common;
-
-    struct compress *compress;
-
-    struct snd_codec codec;
-
-    struct {
-        const uint8_t *data;
-        int len;
-    } write;
-
-    bool started;
-    volatile bool paused; /* prevents standby while in pause */
-
-    struct compr_gapless_mdata g_data;
-    bool refresh_gapless_meta;
-};
-#endif /* TINYHAL_COMPRESS_PLAYBACK */
-
-struct in_resampler {
-    struct resampler_itfe *resampler;
-    struct resampler_buffer_provider buf_provider;
-    int16_t *buffer;
-    size_t in_buffer_size;
-    int in_buffer_frames;
-    size_t frames_in;
-    int read_status;
+static const struct string_to_enum out_channels_name_to_enum_table[] = {
+    STRING_TO_ENUM(AUDIO_CHANNEL_OUT_STEREO),
+    STRING_TO_ENUM(AUDIO_CHANNEL_OUT_5POINT1),
+    STRING_TO_ENUM(AUDIO_CHANNEL_OUT_7POINT1),
 };
 
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-struct in_unshorten {
-    struct unshorten unshorten;
-    int8_t *in_buffer;
-    size_t in_buffer_size;
-    char * accumulator_buf;
-    char * accumulator_p;
-    size_t accumulator_buf_size;
-    size_t accumulator_avail;
-};
-#endif
+static void dummybuf_thread_close(struct audio_device *adev);
 
-typedef void(*in_close_fn)(struct audio_stream *);
-
-/* Fields common to all types of input stream */
-struct stream_in_common {
-    struct audio_stream_in stream;
-
-    in_close_fn    close;
-    struct audio_device *dev;
-    const struct hw_stream* hw;
-
-    pthread_mutex_t lock;
-
-    bool standby;
-
-    /* Stream parameters as seen by AudioFlinger
-     * If stream is resampling AudioFlinger buffers before
-     * passing them to hardware, these members refer to the
-     * _input_ data from AudioFlinger
-     */
-    audio_devices_t devices;
-    audio_format_t format;
-    uint32_t channel_mask;
-    int channel_count;
-    uint32_t sample_rate;
-    size_t frame_size;
-    size_t buffer_size;
-
-    int input_source;
-
-    nsecs_t last_read_ns;
-};
-
-struct stream_in_pcm {
-    struct stream_in_common common;
-
-    union {
-        struct pcm *pcm;
-        struct compress *compress;
-    };
-
-    uint32_t hw_sample_rate;    /* actual sample rate of hardware */
-    int hw_channel_count;  /* actual number of input channels */
-    uint32_t period_size;       /* ... of PCM input */
-
-    struct in_resampler resampler;
-
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-    struct in_unshorten unshorten;
-#endif
-};
-
-static uint32_t out_get_sample_rate(const struct audio_stream *stream);
-static uint32_t in_get_sample_rate(const struct audio_stream *stream);
-static void voice_trigger_audio_started_locked(struct audio_device *adev);
-static void voice_trigger_audio_ended_locked(struct audio_device *adev);
-static const char *voice_trigger_audio_stream_name(struct audio_device *adev);
-
-/*********************************************************************
- * Stream common functions
- *********************************************************************/
-
-static int stream_invoke_usecases(const struct hw_stream *stream, const char *kvpairs)
+static bool is_supported_format(audio_format_t format)
 {
-    char *parms = strdup(kvpairs);
-    char *p, *temp;
-    char *pval;
-    char value[32];
-    int ret;
+    if (format == AUDIO_FORMAT_MP3 ||
+            ((format & AUDIO_FORMAT_MAIN_MASK) == AUDIO_FORMAT_AAC))
+        return true;
 
-    ALOGV("+stream_invoke_usecases(%p) '%s'", stream, kvpairs);
+    return false;
+}
 
-    if (!parms) {
-        return -ENOMEM;
+static int get_snd_codec_id(audio_format_t format)
+{
+    int id = 0;
+
+    switch (format & AUDIO_FORMAT_MAIN_MASK) {
+    case AUDIO_FORMAT_MP3:
+        id = SND_AUDIOCODEC_MP3;
+        break;
+    case AUDIO_FORMAT_AAC:
+        id = SND_AUDIOCODEC_AAC;
+        break;
+    default:
+        ALOGE("%s: Unsupported audio format", __func__);
     }
 
-    /* It's not obvious what we should do if multiple parameters
-     * are given and we only understand some. The action taken
-     * here is to process all that we understand and only return
-     * and error if we don't understand any
-     */
-    ret = -ENOTSUP;
+    return id;
+}
 
-    if (stream != NULL) {
-        p = strtok_r(parms, ";", &temp);
-        while(p) {
-            pval = strchr(p, '=');
-            if (pval && (pval[1] != '\0')) {
-                *pval = '\0';
-                if (apply_use_case(stream, p, pval+1) >= 0) {
-                    ret = 0;
+/* Array to store sound devices */
+static const char * const device_table[SND_DEVICE_MAX] = {
+    [SND_DEVICE_NONE] = "none",
+    /* Playback sound devices */
+    [SND_DEVICE_OUT_HANDSET] = "handset",
+    [SND_DEVICE_OUT_SPEAKER] = "speaker",
+    [SND_DEVICE_OUT_HEADPHONES] = "headphones",
+    [SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES] = "speaker-and-headphones",
+    [SND_DEVICE_OUT_VOICE_HANDSET] = "voice-handset",
+    [SND_DEVICE_OUT_VOICE_SPEAKER] = "voice-speaker",
+    [SND_DEVICE_OUT_VOICE_HEADPHONES] = "voice-headphones",
+    [SND_DEVICE_OUT_HDMI] = "hdmi",
+    [SND_DEVICE_OUT_SPEAKER_AND_HDMI] = "speaker-and-hdmi",
+    [SND_DEVICE_OUT_BT_SCO] = "bt-sco-headset",
+    [SND_DEVICE_OUT_VOICE_TTY_FULL_HEADPHONES] = "voice-tty-full-headphones",
+    [SND_DEVICE_OUT_VOICE_TTY_VCO_HEADPHONES] = "voice-tty-vco-headphones",
+    [SND_DEVICE_OUT_VOICE_TTY_HCO_HANDSET] = "voice-tty-hco-handset",
+
+    /* Capture sound devices */
+    [SND_DEVICE_IN_HANDSET_MIC] = "handset-mic",
+    [SND_DEVICE_IN_SPEAKER_MIC] = "speaker-mic",
+    [SND_DEVICE_IN_HEADSET_MIC] = "headset-mic",
+    [SND_DEVICE_IN_HANDSET_MIC_AEC] = "handset-mic",
+    [SND_DEVICE_IN_SPEAKER_MIC_AEC] = "voice-speaker-mic",
+    [SND_DEVICE_IN_HEADSET_MIC_AEC] = "headset-mic",
+    [SND_DEVICE_IN_VOICE_SPEAKER_MIC] = "voice-speaker-mic",
+    [SND_DEVICE_IN_VOICE_HEADSET_MIC] = "voice-headset-mic",
+    [SND_DEVICE_IN_HDMI_MIC] = "hdmi-mic",
+    [SND_DEVICE_IN_BT_SCO_MIC] = "bt-sco-mic",
+    [SND_DEVICE_IN_CAMCORDER_MIC] = "camcorder-mic",
+    [SND_DEVICE_IN_VOICE_DMIC_1] = "voice-dmic-1",
+    [SND_DEVICE_IN_VOICE_SPEAKER_DMIC_1] = "voice-speaker-dmic-1",
+    [SND_DEVICE_IN_VOICE_TTY_FULL_HEADSET_MIC] = "voice-tty-full-headset-mic",
+    [SND_DEVICE_IN_VOICE_TTY_VCO_HANDSET_MIC] = "voice-tty-vco-handset-mic",
+    [SND_DEVICE_IN_VOICE_TTY_HCO_HEADSET_MIC] = "voice-tty-hco-headset-mic",
+    [SND_DEVICE_IN_VOICE_REC_HEADSET_MIC] = "voice-rec-headset-mic",
+    [SND_DEVICE_IN_VOICE_REC_MIC] = "voice-rec-mic",
+    [SND_DEVICE_IN_VOICE_REC_DMIC_1] = "voice-rec-dmic-1",
+    [SND_DEVICE_IN_VOICE_REC_DMIC_NS_1] = "voice-rec-dmic-ns-1",
+    [SND_DEVICE_IN_LOOPBACK_AEC] = "loopback-aec",
+};
+
+static struct mixer_card *adev_get_mixer_for_card(struct audio_device *adev, int card)
+{
+    struct mixer_card *mixer_card;
+    struct listnode *node;
+
+    list_for_each(node, &adev->mixer_list) {
+        mixer_card = node_to_item(node, struct mixer_card, adev_list_node);
+        if (mixer_card->card == card)
+            return mixer_card;
+    }
+    return NULL;
+}
+
+static struct mixer_card *uc_get_mixer_for_card(struct audio_usecase *usecase, int card)
+{
+    struct mixer_card *mixer_card;
+    struct listnode *node;
+
+    list_for_each(node, &usecase->mixer_list) {
+        mixer_card = node_to_item(node, struct mixer_card, uc_list_node[usecase->id]);
+        if (mixer_card->card == card)
+            return mixer_card;
+    }
+    return NULL;
+}
+
+static void free_mixer_list(struct audio_device *adev)
+{
+    struct mixer_card *mixer_card;
+    struct listnode *node;
+    struct listnode *next;
+
+    list_for_each_safe(node, next, &adev->mixer_list) {
+        mixer_card = node_to_item(node, struct mixer_card, adev_list_node);
+        list_remove(node);
+        audio_route_free(mixer_card->audio_route);
+        free(mixer_card);
+    }
+}
+
+static int mixer_init(struct audio_device *adev)
+{
+    int i;
+    int card;
+    int retry_num;
+    struct mixer *mixer;
+    struct audio_route *audio_route;
+    char mixer_path[PATH_MAX];
+    struct mixer_card *mixer_card;
+    struct listnode *node;
+
+    list_init(&adev->mixer_list);
+
+    for (i = 0; pcm_devices[i] != NULL; i++) {
+        card = pcm_devices[i]->card;
+        if (adev_get_mixer_for_card(adev, card) == NULL) {
+            retry_num = 0;
+            do {
+                mixer = mixer_open(card);
+                if (mixer == NULL) {
+                    if (++retry_num > RETRY_NUMBER) {
+                        ALOGE("%s unable to open the mixer for--card %d, aborting.",
+                              __func__, card);
+                        goto error;
+                    }
+                    usleep(RETRY_US);
                 }
-                *pval = '=';
+            } while (mixer == NULL);
+
+            sprintf(mixer_path, "/system/etc/mixer_paths_%d.xml", card);
+            audio_route = audio_route_init(card, mixer_path);
+            if (!audio_route) {
+                ALOGE("%s: Failed to init audio route controls for card %d, aborting.",
+                      __func__, card);
+                goto error;
             }
-            p = strtok_r(NULL, ";", &temp);
+            mixer_card = calloc(1, sizeof(struct mixer_card));
+            mixer_card->card = card;
+            mixer_card->mixer = mixer;
+            mixer_card->audio_route = audio_route;
+            list_add_tail(&adev->mixer_list, &mixer_card->adev_list_node);
         }
     }
 
-    return ret;
+    return 0;
+
+error:
+    free_mixer_list(adev);
+    return -ENODEV;
 }
 
-static int common_get_routing_param(uint32_t *vout, const char *kvpairs)
+static const char *get_snd_device_name(snd_device_t snd_device)
 {
-    struct str_parms *parms;
-    char value[32];
-    int ret;
+    const char *name = NULL;
 
-    parms = str_parms_create_str(kvpairs);
+    if (snd_device >= SND_DEVICE_MIN && snd_device < SND_DEVICE_MAX)
+        name = device_table[snd_device];
 
-    ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING,
-                            value, sizeof(value));
-    if (ret >= 0) {
-        *vout = atoi(value);
+    ALOGE_IF(name == NULL, "%s: invalid snd device %d", __func__, snd_device);
+
+   return name;
+}
+
+static const char *get_snd_device_display_name(snd_device_t snd_device)
+{
+    const char *name = get_snd_device_name(snd_device);
+
+    if (name == NULL)
+        name = "SND DEVICE NOT FOUND";
+
+    return name;
+}
+
+static struct pcm_device_profile *get_pcm_device(usecase_type_t uc_type, audio_devices_t devices)
+{
+    int i;
+
+    devices &= ~AUDIO_DEVICE_BIT_IN;
+    for (i = 0; pcm_devices[i] != NULL; i++) {
+        if ((pcm_devices[i]->type == uc_type) &&
+                (devices & pcm_devices[i]->devices))
+            break;
     }
-    str_parms_destroy(parms);
+    return pcm_devices[i];
+}
+
+static struct audio_usecase *get_usecase_from_id(struct audio_device *adev,
+                                                   audio_usecase_t uc_id)
+{
+    struct audio_usecase *usecase;
+    struct listnode *node;
+
+    list_for_each(node, &adev->usecase_list) {
+        usecase = node_to_item(node, struct audio_usecase, adev_list_node);
+        if (usecase->id == uc_id)
+            return usecase;
+    }
+    return NULL;
+}
+
+static struct audio_usecase *get_usecase_from_type(struct audio_device *adev,
+                                                        usecase_type_t type)
+{
+    struct audio_usecase *usecase;
+    struct listnode *node;
+
+    list_for_each(node, &adev->usecase_list) {
+        usecase = node_to_item(node, struct audio_usecase, adev_list_node);
+        if (usecase->type & type)
+            return usecase;
+    }
+    return NULL;
+}
+
+/* always called with adev lock held */
+static int set_voice_volume_l(struct audio_device *adev, float volume)
+{
+    int err = 0;
+    (void)volume;
+
+    if (adev->mode == AUDIO_MODE_IN_CALL) {
+        /* TODO */
+    }
+    return err;
+}
+
+
+static snd_device_t get_output_snd_device(struct audio_device *adev, audio_devices_t devices)
+{
+
+    audio_mode_t mode = adev->mode;
+    snd_device_t snd_device = SND_DEVICE_NONE;
+
+    ALOGV("%s: enter: output devices(%#x), mode(%d)", __func__, devices, mode);
+    if (devices == AUDIO_DEVICE_NONE ||
+        devices & AUDIO_DEVICE_BIT_IN) {
+        ALOGV("%s: Invalid output devices (%#x)", __func__, devices);
+        goto exit;
+    }
+
+    if (mode == AUDIO_MODE_IN_CALL) {
+        if (devices & AUDIO_DEVICE_OUT_WIRED_HEADPHONE ||
+            devices & AUDIO_DEVICE_OUT_WIRED_HEADSET) {
+            if (adev->tty_mode == TTY_MODE_FULL)
+                snd_device = SND_DEVICE_OUT_VOICE_TTY_FULL_HEADPHONES;
+            else if (adev->tty_mode == TTY_MODE_VCO)
+                snd_device = SND_DEVICE_OUT_VOICE_TTY_VCO_HEADPHONES;
+            else if (adev->tty_mode == TTY_MODE_HCO)
+                snd_device = SND_DEVICE_OUT_VOICE_TTY_HCO_HANDSET;
+            else
+                snd_device = SND_DEVICE_OUT_VOICE_HEADPHONES;
+        } else if (devices & AUDIO_DEVICE_OUT_ALL_SCO) {
+            snd_device = SND_DEVICE_OUT_BT_SCO;
+        } else if (devices & AUDIO_DEVICE_OUT_SPEAKER) {
+            snd_device = SND_DEVICE_OUT_VOICE_SPEAKER;
+        } else if (devices & AUDIO_DEVICE_OUT_EARPIECE) {
+            snd_device = SND_DEVICE_OUT_HANDSET;
+        }
+        if (snd_device != SND_DEVICE_NONE) {
+            goto exit;
+        }
+    }
+
+    if (popcount(devices) == 2) {
+        if (devices == (AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
+                        AUDIO_DEVICE_OUT_SPEAKER)) {
+            snd_device = SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES;
+        } else if (devices == (AUDIO_DEVICE_OUT_WIRED_HEADSET |
+                               AUDIO_DEVICE_OUT_SPEAKER)) {
+            snd_device = SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES;
+        } else {
+            ALOGE("%s: Invalid combo device(%#x)", __func__, devices);
+            goto exit;
+        }
+        if (snd_device != SND_DEVICE_NONE) {
+            goto exit;
+        }
+    }
+
+    if (popcount(devices) != 1) {
+        ALOGE("%s: Invalid output devices(%#x)", __func__, devices);
+        goto exit;
+    }
+
+    if (devices & AUDIO_DEVICE_OUT_WIRED_HEADPHONE ||
+        devices & AUDIO_DEVICE_OUT_WIRED_HEADSET) {
+        snd_device = SND_DEVICE_OUT_HEADPHONES;
+    } else if (devices & AUDIO_DEVICE_OUT_SPEAKER) {
+        snd_device = SND_DEVICE_OUT_SPEAKER;
+    } else if (devices & AUDIO_DEVICE_OUT_ALL_SCO) {
+        snd_device = SND_DEVICE_OUT_BT_SCO;
+    } else if (devices & AUDIO_DEVICE_OUT_EARPIECE) {
+        snd_device = SND_DEVICE_OUT_HANDSET;
+    } else {
+        ALOGE("%s: Unknown device(s) %#x", __func__, devices);
+    }
+exit:
+    ALOGV("%s: exit: snd_device(%s)", __func__, device_table[snd_device]);
+    return snd_device;
+}
+
+static snd_device_t get_input_snd_device(struct audio_device *adev, audio_devices_t out_device)
+{
+    audio_source_t  source;
+    audio_mode_t    mode   = adev->mode;
+    audio_devices_t in_device;
+    audio_channel_mask_t channel_mask;
+    snd_device_t snd_device = SND_DEVICE_NONE;
+    struct stream_in *active_input = NULL;
+    struct audio_usecase *usecase;
+
+    usecase = get_usecase_from_type(adev, PCM_CAPTURE|VOICE_CALL);
+    if (usecase != NULL) {
+        active_input = (struct stream_in *)usecase->stream;
+    }
+    source = (active_input == NULL) ?
+                                AUDIO_SOURCE_DEFAULT : active_input->source;
+
+    in_device = ((active_input == NULL) ?
+                                    AUDIO_DEVICE_NONE : active_input->devices)
+                                & ~AUDIO_DEVICE_BIT_IN;
+    channel_mask = (active_input == NULL) ?
+                                AUDIO_CHANNEL_IN_MONO : active_input->main_channels;
+
+    ALOGV("%s: enter: out_device(%#x) in_device(%#x)",
+          __func__, out_device, in_device);
+    if (mode == AUDIO_MODE_IN_CALL) {
+        if (out_device == AUDIO_DEVICE_NONE) {
+            ALOGE("%s: No output device set for voice call", __func__);
+            goto exit;
+        }
+        if (adev->tty_mode != TTY_MODE_OFF) {
+            if (out_device & AUDIO_DEVICE_OUT_WIRED_HEADPHONE ||
+                out_device & AUDIO_DEVICE_OUT_WIRED_HEADSET) {
+                switch (adev->tty_mode) {
+                case TTY_MODE_FULL:
+                    snd_device = SND_DEVICE_IN_VOICE_TTY_FULL_HEADSET_MIC;
+                    break;
+                case TTY_MODE_VCO:
+                    snd_device = SND_DEVICE_IN_VOICE_TTY_VCO_HANDSET_MIC;
+                    break;
+                case TTY_MODE_HCO:
+                    snd_device = SND_DEVICE_IN_VOICE_TTY_HCO_HEADSET_MIC;
+                    break;
+                default:
+                    ALOGE("%s: Invalid TTY mode (%#x)", __func__, adev->tty_mode);
+                }
+                goto exit;
+            }
+        }
+        if (out_device & AUDIO_DEVICE_OUT_EARPIECE ||
+                out_device & AUDIO_DEVICE_OUT_WIRED_HEADPHONE) {
+            snd_device = SND_DEVICE_IN_HANDSET_MIC;
+        } else if (out_device & AUDIO_DEVICE_OUT_WIRED_HEADSET) {
+            snd_device = SND_DEVICE_IN_VOICE_HEADSET_MIC;
+        } else if (out_device & AUDIO_DEVICE_OUT_ALL_SCO) {
+            snd_device = SND_DEVICE_IN_BT_SCO_MIC ;
+        } else if (out_device & AUDIO_DEVICE_OUT_SPEAKER) {
+            snd_device = SND_DEVICE_IN_VOICE_SPEAKER_MIC;
+        }
+    } else if (source == AUDIO_SOURCE_CAMCORDER) {
+        if (in_device & AUDIO_DEVICE_IN_BUILTIN_MIC ||
+            in_device & AUDIO_DEVICE_IN_BACK_MIC) {
+            snd_device = SND_DEVICE_IN_CAMCORDER_MIC;
+        }
+    } else if (source == AUDIO_SOURCE_VOICE_RECOGNITION) {
+        if (in_device & AUDIO_DEVICE_IN_BUILTIN_MIC) {
+            if (adev->dualmic_config == DUALMIC_CONFIG_1) {
+                if (channel_mask == AUDIO_CHANNEL_IN_FRONT_BACK)
+                    snd_device = SND_DEVICE_IN_VOICE_REC_DMIC_1;
+                else if (adev->ns_in_voice_rec)
+                    snd_device = SND_DEVICE_IN_VOICE_REC_DMIC_NS_1;
+            }
+
+            if (snd_device == SND_DEVICE_NONE) {
+                snd_device = SND_DEVICE_IN_VOICE_REC_MIC;
+            }
+        } else if (in_device & AUDIO_DEVICE_IN_WIRED_HEADSET) {
+            snd_device = SND_DEVICE_IN_VOICE_REC_HEADSET_MIC;
+        }
+    } else if (source == AUDIO_SOURCE_VOICE_COMMUNICATION || source == AUDIO_SOURCE_MIC) {
+        if (out_device & AUDIO_DEVICE_OUT_SPEAKER)
+            in_device = AUDIO_DEVICE_IN_BACK_MIC;
+        if (active_input) {
+            if (active_input->enable_aec) {
+                if (in_device & AUDIO_DEVICE_IN_BACK_MIC) {
+                    snd_device = SND_DEVICE_IN_SPEAKER_MIC_AEC;
+                } else if (in_device & AUDIO_DEVICE_IN_BUILTIN_MIC) {
+                    if (out_device & AUDIO_DEVICE_OUT_WIRED_HEADPHONE) {
+                        snd_device = SND_DEVICE_IN_SPEAKER_MIC_AEC;
+                    } else {
+                        snd_device = SND_DEVICE_IN_HANDSET_MIC_AEC;
+                    }
+                } else if (in_device & AUDIO_DEVICE_IN_WIRED_HEADSET) {
+                    snd_device = SND_DEVICE_IN_HEADSET_MIC_AEC;
+                }
+            }
+            /* TODO: set echo reference */
+        }
+    } else if (source == AUDIO_SOURCE_DEFAULT) {
+        goto exit;
+    }
+
+
+    if (snd_device != SND_DEVICE_NONE) {
+        goto exit;
+    }
+
+    if (in_device != AUDIO_DEVICE_NONE &&
+            !(in_device & AUDIO_DEVICE_IN_VOICE_CALL) &&
+            !(in_device & AUDIO_DEVICE_IN_COMMUNICATION)) {
+        if (in_device & AUDIO_DEVICE_IN_BUILTIN_MIC) {
+            snd_device = SND_DEVICE_IN_HANDSET_MIC;
+        } else if (in_device & AUDIO_DEVICE_IN_BACK_MIC) {
+            snd_device = SND_DEVICE_IN_SPEAKER_MIC;
+        } else if (in_device & AUDIO_DEVICE_IN_WIRED_HEADSET) {
+            snd_device = SND_DEVICE_IN_HEADSET_MIC;
+        } else if (in_device & AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET) {
+            snd_device = SND_DEVICE_IN_BT_SCO_MIC ;
+        } else if (in_device & AUDIO_DEVICE_IN_AUX_DIGITAL) {
+            snd_device = SND_DEVICE_IN_HDMI_MIC;
+        } else {
+            ALOGE("%s: Unknown input device(s) %#x", __func__, in_device);
+            ALOGW("%s: Using default handset-mic", __func__);
+            snd_device = SND_DEVICE_IN_HANDSET_MIC;
+        }
+    } else {
+        if (out_device & AUDIO_DEVICE_OUT_EARPIECE) {
+            snd_device = SND_DEVICE_IN_HANDSET_MIC;
+        } else if (out_device & AUDIO_DEVICE_OUT_WIRED_HEADSET) {
+            snd_device = SND_DEVICE_IN_HEADSET_MIC;
+        } else if (out_device & AUDIO_DEVICE_OUT_SPEAKER) {
+            snd_device = SND_DEVICE_IN_SPEAKER_MIC;
+        } else if (out_device & AUDIO_DEVICE_OUT_WIRED_HEADPHONE) {
+            snd_device = SND_DEVICE_IN_HANDSET_MIC;
+        } else if (out_device & AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET) {
+            snd_device = SND_DEVICE_IN_BT_SCO_MIC;
+        } else {
+            ALOGE("%s: Unknown output device(s) %#x", __func__, out_device);
+            ALOGW("%s: Using default handset-mic", __func__);
+            snd_device = SND_DEVICE_IN_HANDSET_MIC;
+        }
+    }
+exit:
+    ALOGV("%s: exit: in_snd_device(%s)", __func__, device_table[snd_device]);
+    return snd_device;
+}
+
+static int set_hdmi_channels(struct audio_device *adev,  int channel_count)
+{
+    struct mixer_ctl *ctl;
+    const char *mixer_ctl_name = "";
+    (void)adev;
+    (void)channel_count;
+    /* TODO */
+
+    return 0;
+}
+
+static int edid_get_max_channels(struct audio_device *adev)
+{
+    int max_channels = 2;
+    struct mixer_ctl *ctl;
+    (void)adev;
+
+    /* TODO */
+    return max_channels;
+}
+
+/* Delay in Us */
+static int64_t render_latency(audio_usecase_t usecase)
+{
+    (void)usecase;
+    /* TODO */
+    return 0;
+}
+
+static int enable_snd_device(struct audio_device *adev,
+                             struct audio_usecase *uc_info,
+                             snd_device_t snd_device,
+                             bool update_mixer)
+{
+    struct mixer_card *mixer_card;
+    struct listnode *node;
+    const char *snd_device_name = get_snd_device_name(snd_device);
+
+    if (snd_device_name == NULL)
+        return -EINVAL;
+
+    if (snd_device == SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES) {
+        ALOGV("Request to enable combo device: enable individual devices\n");
+        enable_snd_device(adev, uc_info, SND_DEVICE_OUT_SPEAKER, update_mixer);
+        enable_snd_device(adev, uc_info, SND_DEVICE_OUT_HEADPHONES, update_mixer);
+        return 0;
+    }
+    adev->snd_dev_ref_cnt[snd_device]++;
+    if (adev->snd_dev_ref_cnt[snd_device] > 1) {
+        ALOGV("%s: snd_device(%d: %s) is already active",
+              __func__, snd_device, snd_device_name);
+        return 0;
+    }
+
+    ALOGV("%s: snd_device(%d: %s)", __func__,
+          snd_device, snd_device_name);
+
+    list_for_each(node, &uc_info->mixer_list) {
+        mixer_card = node_to_item(node, struct mixer_card, uc_list_node[uc_info->id]);
+        audio_route_apply_path(mixer_card->audio_route, snd_device_name);
+        if (update_mixer)
+            audio_route_update_mixer(mixer_card->audio_route);
+    }
+
+    return 0;
+}
+
+static int disable_snd_device(struct audio_device *adev,
+                              struct audio_usecase *uc_info,
+                              snd_device_t snd_device,
+                              bool update_mixer)
+{
+    struct mixer_card *mixer_card;
+    struct listnode *node;
+    const char *snd_device_name = get_snd_device_name(snd_device);
+
+    if (snd_device_name == NULL)
+        return -EINVAL;
+
+    if (snd_device == SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES) {
+        ALOGV("Request to disable combo device: disable individual devices\n");
+        disable_snd_device(adev, uc_info, SND_DEVICE_OUT_SPEAKER, update_mixer);
+        disable_snd_device(adev, uc_info, SND_DEVICE_OUT_HEADPHONES, update_mixer);
+        return 0;
+    }
+
+    if (adev->snd_dev_ref_cnt[snd_device] <= 0) {
+        ALOGE("%s: device ref cnt is already 0", __func__);
+        return -EINVAL;
+    }
+    adev->snd_dev_ref_cnt[snd_device]--;
+    if (adev->snd_dev_ref_cnt[snd_device] == 0) {
+        ALOGV("%s: snd_device(%d: %s)", __func__,
+              snd_device, snd_device_name);
+        list_for_each(node, &uc_info->mixer_list) {
+            mixer_card = node_to_item(node, struct mixer_card, uc_list_node[uc_info->id]);
+            audio_route_reset_path(mixer_card->audio_route, snd_device_name);
+            if (update_mixer)
+                audio_route_update_mixer(mixer_card->audio_route);
+        }
+    }
+    return 0;
+}
+
+static int select_devices(struct audio_device *adev,
+                          audio_usecase_t uc_id)
+{
+    snd_device_t out_snd_device = SND_DEVICE_NONE;
+    snd_device_t in_snd_device = SND_DEVICE_NONE;
+    struct audio_usecase *usecase = NULL;
+    struct audio_usecase *vc_usecase = NULL;
+    struct listnode *node;
+    struct stream_in *active_input = NULL;
+    struct stream_out *active_out;
+    struct mixer_card *mixer_card;
+
+    ALOGV("%s: usecase(%d)", __func__, uc_id);
+
+    if (uc_id == USECASE_AUDIO_CAPTURE_HOTWORD)
+        return 0;
+
+    usecase = get_usecase_from_type(adev, PCM_CAPTURE|VOICE_CALL);
+    if (usecase != NULL) {
+        active_input = (struct stream_in *)usecase->stream;
+    }
+
+    usecase = get_usecase_from_id(adev, uc_id);
+    if (usecase == NULL) {
+        ALOGE("%s: Could not find the usecase(%d)", __func__, uc_id);
+        return -EINVAL;
+    }
+    active_out = (struct stream_out *)usecase->stream;
+
+    if (usecase->type == VOICE_CALL) {
+        out_snd_device = get_output_snd_device(adev, active_out->devices);
+        in_snd_device = get_input_snd_device(adev, active_out->devices);
+        usecase->devices = active_out->devices;
+    } else {
+        /*
+         * If the voice call is active, use the sound devices of voice call usecase
+         * so that it would not result any device switch. All the usecases will
+         * be switched to new device when select_devices() is called for voice call
+         * usecase.
+         */
+        if (adev->in_call) {
+            vc_usecase = get_usecase_from_id(adev, USECASE_VOICE_CALL);
+            if (usecase == NULL) {
+                ALOGE("%s: Could not find the voice call usecase", __func__);
+            } else {
+                in_snd_device = vc_usecase->in_snd_device;
+                out_snd_device = vc_usecase->out_snd_device;
+            }
+        }
+        if (usecase->type == PCM_PLAYBACK) {
+            usecase->devices = active_out->devices;
+            in_snd_device = SND_DEVICE_NONE;
+            if (out_snd_device == SND_DEVICE_NONE) {
+                out_snd_device = get_output_snd_device(adev, active_out->devices);
+                if (active_out == adev->primary_output &&
+                        active_input &&
+                        active_input->source == AUDIO_SOURCE_VOICE_COMMUNICATION) {
+                    select_devices(adev, active_input->usecase);
+                }
+            }
+        } else if (usecase->type == PCM_CAPTURE) {
+            usecase->devices = ((struct stream_in *)usecase->stream)->devices;
+            out_snd_device = SND_DEVICE_NONE;
+            if (in_snd_device == SND_DEVICE_NONE) {
+                if (active_input->source == AUDIO_SOURCE_VOICE_COMMUNICATION &&
+                        adev->primary_output && !adev->primary_output->standby) {
+                    in_snd_device = get_input_snd_device(adev, adev->primary_output->devices);
+                } else {
+                    in_snd_device = get_input_snd_device(adev, AUDIO_DEVICE_NONE);
+                }
+            }
+        }
+    }
+
+    if (out_snd_device == usecase->out_snd_device &&
+        in_snd_device == usecase->in_snd_device) {
+        return 0;
+    }
+
+    ALOGV("%s: out_snd_device(%d: %s) in_snd_device(%d: %s)", __func__,
+          out_snd_device, get_snd_device_display_name(out_snd_device),
+          in_snd_device,  get_snd_device_display_name(in_snd_device));
+
+
+    /* Disable current sound devices */
+    if (usecase->out_snd_device != SND_DEVICE_NONE) {
+        pthread_mutex_lock(&adev->tfa9895_lock);
+        disable_snd_device(adev, usecase, usecase->out_snd_device, false);
+        pthread_mutex_unlock(&adev->tfa9895_lock);
+    }
+
+    if (usecase->in_snd_device != SND_DEVICE_NONE) {
+        disable_snd_device(adev, usecase, usecase->in_snd_device, false);
+    }
+
+    /* Enable new sound devices */
+    if (out_snd_device != SND_DEVICE_NONE) {
+        enable_snd_device(adev, usecase, out_snd_device, false);
+    }
+
+    if (in_snd_device != SND_DEVICE_NONE) {
+        enable_snd_device(adev, usecase, in_snd_device, false);
+    }
+
+    list_for_each(node, &usecase->mixer_list) {
+         mixer_card = node_to_item(node, struct mixer_card, uc_list_node[usecase->id]);
+         audio_route_update_mixer(mixer_card->audio_route);
+    }
+
+    usecase->in_snd_device = in_snd_device;
+    usecase->out_snd_device = out_snd_device;
+
+    if (out_snd_device != SND_DEVICE_NONE)
+        if (usecase->devices & (AUDIO_DEVICE_OUT_WIRED_HEADSET | AUDIO_DEVICE_OUT_WIRED_HEADPHONE))
+            if (adev->htc_acoustic_set_rt5506_amp != NULL)
+                adev->htc_acoustic_set_rt5506_amp(adev->mode, usecase->devices);
+    return 0;
+}
+
+
+static ssize_t read_frames(struct stream_in *in, void *buffer, ssize_t frames);
+static int do_in_standby_l(struct stream_in *in);
+
+#ifdef PREPROCESSING_ENABLED
+static void get_capture_reference_delay(struct stream_in *in,
+                              size_t frames __unused,
+                              struct echo_reference_buffer *buffer)
+{
+    ALOGVV("%s: enter:)", __func__);
+
+    /* read frames available in kernel driver buffer */
+    unsigned int kernel_frames;
+    struct timespec tstamp;
+    long buf_delay;
+    long kernel_delay;
+    long delay_ns;
+    struct pcm_device *ref_device;
+    long rsmp_delay = 0;
+
+    ref_device = node_to_item(list_tail(&in->pcm_dev_list),
+                              struct pcm_device, stream_list_node);
+
+    if (pcm_get_htimestamp(ref_device->pcm, &kernel_frames, &tstamp) < 0) {
+        buffer->time_stamp.tv_sec  = 0;
+        buffer->time_stamp.tv_nsec = 0;
+        buffer->delay_ns           = 0;
+        ALOGW("read get_capture_reference_delay(): pcm_htimestamp error");
+        return;
+    }
+
+    /* adjust render time stamp with delay added by current driver buffer.
+    * Add the duration of current frame as we want the render time of the last
+    * sample being written. */
+
+    kernel_delay = (long)(((int64_t)kernel_frames * 1000000000) / ref_device->pcm_profile->config.rate);
+
+    buffer->time_stamp = tstamp;
+    buffer->delay_ns = kernel_delay;
+
+    ALOGVV("get_capture_reference_delay_time_stamp Secs: [%10ld], nSecs: [%9ld], kernel_frames: [%5d],"
+          " delay_ns: [%d] , frames:[%zd]",
+           buffer->time_stamp.tv_sec , buffer->time_stamp.tv_nsec, kernel_frames, buffer->delay_ns, frames);
+}
+
+static void get_capture_delay(struct stream_in *in,
+                              size_t frames __unused,
+                              struct echo_reference_buffer *buffer)
+{
+    ALOGVV("%s: enter:)", __func__);
+    /* read frames available in kernel driver buffer */
+    unsigned int kernel_frames;
+    struct timespec tstamp;
+    long buf_delay;
+    long rsmp_delay;
+    long kernel_delay;
+    long delay_ns;
+    struct pcm_device *pcm_device;
+
+    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
+                              struct pcm_device, stream_list_node);
+
+    if (pcm_get_htimestamp(pcm_device->pcm, &kernel_frames, &tstamp) < 0) {
+        buffer->time_stamp.tv_sec  = 0;
+        buffer->time_stamp.tv_nsec = 0;
+        buffer->delay_ns           = 0;
+        ALOGW("read get_capture_delay(): pcm_htimestamp error");
+        return;
+    }
+
+    /* read frames available in audio HAL input buffer
+     * add number of frames being read as we want the capture time of first sample
+     * in current buffer */
+    /* frames in in->read_buf are at driver sampling rate while frames in in->proc_buf are
+     * at requested sampling rate */
+    buf_delay = (long)(((int64_t)(in->read_buf_frames) * 1000000000) / in->config.rate +
+                       ((int64_t)(in->proc_buf_frames) * 1000000000) / in->requested_rate );
+
+    /* add delay introduced by resampler */
+    rsmp_delay = 0;
+    if (in->resampler) {
+        rsmp_delay = in->resampler->delay_ns(in->resampler);
+    }
+
+    kernel_delay = (long)(((int64_t)kernel_frames * 1000000000) / in->config.rate);
+
+    delay_ns = kernel_delay + buf_delay + rsmp_delay;
+
+    buffer->time_stamp = tstamp;
+    buffer->delay_ns   = delay_ns;
+    ALOGVV("get_capture_delay_time_stamp Secs: [%10ld], nSecs: [%9ld], kernel_frames:[%5d],"
+         " delay_ns: [%d], kernel_delay:[%ld], buf_delay:[%ld], rsmp_delay:[%ld],  "
+         "in->read_buf_frames:[%zd], in->proc_buf_frames:[%zd], frames:[%zd]",
+         buffer->time_stamp.tv_sec , buffer->time_stamp.tv_nsec, kernel_frames,
+         buffer->delay_ns, kernel_delay, buf_delay, rsmp_delay,
+         in->read_buf_frames, in->proc_buf_frames, frames);
+}
+
+static int32_t update_echo_reference(struct stream_in *in, size_t frames)
+{
+    ALOGVV("%s: enter:), in->config.channels(%d)", __func__,in->config.channels);
+    struct echo_reference_buffer b;
+    b.delay_ns = 0;
+    struct pcm_device *pcm_device;
+
+    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
+                              struct pcm_device, stream_list_node);
+
+    ALOGVV("update_echo_reference, in->config.channels(%d), frames = [%zd], in->ref_buf_frames = [%zd],  "
+          "b.frame_count = [%zd]",
+          in->config.channels, frames, in->ref_buf_frames, frames - in->ref_buf_frames);
+    if (in->ref_buf_frames < frames) {
+        if (in->ref_buf_size < frames) {
+            in->ref_buf_size = frames;
+            in->ref_buf = (int16_t *)realloc(in->ref_buf, pcm_frames_to_bytes(pcm_device->pcm, frames));
+            ALOG_ASSERT((in->ref_buf != NULL),
+                        "update_echo_reference() failed to reallocate ref_buf");
+            ALOGVV("update_echo_reference(): ref_buf %p extended to %d bytes",
+                      in->ref_buf, pcm_frames_to_bytes(pcm_device->pcm, frames));
+        }
+        b.frame_count = frames - in->ref_buf_frames;
+        b.raw = (void *)(in->ref_buf + in->ref_buf_frames * in->config.channels);
+
+        get_capture_delay(in, frames, &b);
+
+        if (in->echo_reference->read(in->echo_reference, &b) == 0)
+        {
+            in->ref_buf_frames += b.frame_count;
+            ALOGVV("update_echo_reference(): in->ref_buf_frames:[%zd], "
+                    "in->ref_buf_size:[%zd], frames:[%zd], b.frame_count:[%zd]",
+                 in->ref_buf_frames, in->ref_buf_size, frames, b.frame_count);
+        }
+    } else
+        ALOGW("update_echo_reference(): NOT enough frames to read ref buffer");
+    return b.delay_ns;
+}
+
+static int set_preprocessor_param(effect_handle_t handle,
+                           effect_param_t *param)
+{
+    uint32_t size = sizeof(int);
+    uint32_t psize = ((param->psize - 1) / sizeof(int) + 1) * sizeof(int) +
+                        param->vsize;
+
+    int status = (*handle)->command(handle,
+                                   EFFECT_CMD_SET_PARAM,
+                                   sizeof (effect_param_t) + psize,
+                                   param,
+                                   &size,
+                                   &param->status);
+    if (status == 0)
+        status = param->status;
+
+    return status;
+}
+
+static int set_preprocessor_echo_delay(effect_handle_t handle,
+                                     int32_t delay_us)
+{
+    struct {
+        effect_param_t  param;
+        uint32_t        data_0;
+        int32_t         data_1;
+    } buf;
+    memset(&buf, 0, sizeof(buf));
+
+    buf.param.psize = sizeof(uint32_t);
+    buf.param.vsize = sizeof(uint32_t);
+    buf.data_0 = AEC_PARAM_ECHO_DELAY;
+    buf.data_1 = delay_us;
+
+    return set_preprocessor_param(handle, &buf.param);
+}
+
+static void push_echo_reference(struct stream_in *in, size_t frames)
+{
+    ALOGVV("%s: enter:)", __func__);
+    /* read frames from echo reference buffer and update echo delay
+     * in->ref_buf_frames is updated with frames available in in->ref_buf */
+
+    int32_t delay_us = update_echo_reference(in, frames)/1000;
+    int32_t size_in_bytes = 0;
+    int i;
+    audio_buffer_t buf;
+
+    if (in->ref_buf_frames < frames)
+        frames = in->ref_buf_frames;
+
+    buf.frameCount = frames;
+    buf.raw = in->ref_buf;
+
+    for (i = 0; i < in->num_preprocessors; i++) {
+        if ((*in->preprocessors[i].effect_itfe)->process_reverse == NULL)
+            continue;
+        ALOGVV("%s: effect_itfe)->process_reverse() BEGIN i=(%d) ", __func__, i);
+        (*in->preprocessors[i].effect_itfe)->process_reverse(in->preprocessors[i].effect_itfe,
+                                               &buf,
+                                               NULL);
+        ALOGVV("%s: effect_itfe)->process_reverse() END i=(%d) ", __func__, i);
+        set_preprocessor_echo_delay(in->preprocessors[i].effect_itfe, delay_us);
+    }
+
+    in->ref_buf_frames -= buf.frameCount;
+    ALOGVV("%s: in->ref_buf_frames(%zd), in->config.channels(%d) ",
+           __func__, in->ref_buf_frames, in->config.channels);
+    if (in->ref_buf_frames) {
+        memcpy(in->ref_buf,
+               in->ref_buf + buf.frameCount * in->config.channels,
+               in->ref_buf_frames * in->config.channels * sizeof(int16_t));
+    }
+}
+
+static void put_echo_reference(struct audio_device *adev,
+                          struct echo_reference_itfe *reference)
+{
+    ALOGV("%s: enter:)", __func__);
+    int32_t prev_generation = adev->echo_reference_generation;
+    struct stream_out *out = adev->primary_output;
+
+    if (adev->echo_reference != NULL &&
+            reference == adev->echo_reference) {
+        /* echo reference is taken from the low latency output stream used
+         * for voice use cases */
+        adev->echo_reference = NULL;
+        android_atomic_inc(&adev->echo_reference_generation);
+        if (out != NULL && out->usecase == USECASE_AUDIO_PLAYBACK) {
+            // if the primary output is in standby or did not pick the echo reference yet
+            // we can safely get rid of it here.
+            // otherwise, out_write() or out_standby() will detect the change in echo reference
+            // generation and release the echo reference owned by the stream.
+            if ((out->echo_reference_generation != prev_generation) || out->standby)
+                release_echo_reference(reference);
+        } else {
+            release_echo_reference(reference);
+        }
+        ALOGV("release_echo_reference");
+    }
+}
+
+static struct echo_reference_itfe *get_echo_reference(struct audio_device *adev,
+                                                      audio_format_t format __unused,
+                                                      uint32_t channel_count,
+                                                      uint32_t sampling_rate)
+{
+    ALOGV("%s: enter:)", __func__);
+    put_echo_reference(adev, adev->echo_reference);
+    /* echo reference is taken from the low latency output stream used
+     * for voice use cases */
+    if (adev->primary_output!= NULL && adev->primary_output->usecase == USECASE_AUDIO_PLAYBACK &&
+            !adev->primary_output->standby) {
+        struct audio_stream *stream =
+                &adev->primary_output->stream.common;
+        uint32_t wr_channel_count = audio_channel_count_from_out_mask(stream->get_channels(stream));
+        uint32_t wr_sampling_rate = stream->get_sample_rate(stream);
+        ALOGV("Calling create_echo_reference");
+        int status = create_echo_reference(AUDIO_FORMAT_PCM_16_BIT,
+                                           channel_count,
+                                           sampling_rate,
+                                           AUDIO_FORMAT_PCM_16_BIT,
+                                           wr_channel_count,
+                                           wr_sampling_rate,
+                                           &adev->echo_reference);
+        if (status == 0)
+            android_atomic_inc(&adev->echo_reference_generation);
+    }
+    return adev->echo_reference;
+}
+
+#ifdef HW_AEC_LOOPBACK
+static int get_hw_echo_reference(struct stream_in *in)
+{
+    struct pcm_device_profile *ref_pcm_profile;
+    struct pcm_device *ref_device;
+    struct audio_device *adev = in->dev;
+
+    in->hw_echo_reference = false;
+
+    if (adev->primary_output!= NULL &&
+        !adev->primary_output->standby &&
+        adev->primary_output->usecase == USECASE_AUDIO_PLAYBACK &&
+        adev->primary_output->devices == AUDIO_DEVICE_OUT_SPEAKER) {
+        struct audio_stream *stream = &adev->primary_output->stream.common;
+
+        // TODO: currently there is no low latency mode for aec reference.
+        ref_pcm_profile = get_pcm_device(PCM_CAPTURE, pcm_device_capture_loopback_aec.devices);
+        if (ref_pcm_profile == NULL) {
+            ALOGE("%s: Could not find PCM device id for the usecase(%d)",
+                __func__, pcm_device_capture_loopback_aec.devices);
+            return -EINVAL;
+        }
+
+        ref_device = (struct pcm_device *)calloc(1, sizeof(struct pcm_device));
+        ref_device->pcm_profile = ref_pcm_profile;
+
+        ALOGV("%s: ref_device rate:%d, ch:%d", __func__, ref_pcm_profile->config.rate, ref_pcm_profile->config.channels);
+        ref_device->pcm = pcm_open(ref_device->pcm_profile->card, ref_device->pcm_profile->id, PCM_IN | PCM_MONOTONIC, &ref_device->pcm_profile->config);
+
+        if (ref_device->pcm && !pcm_is_ready(ref_device->pcm)) {
+           ALOGE("%s: %s", __func__, pcm_get_error(ref_device->pcm));
+           pcm_close(ref_device->pcm);
+          ref_device->pcm = NULL;
+          return -EIO;
+        }
+        list_add_tail(&in->pcm_dev_list, &ref_device->stream_list_node);
+
+        in->hw_echo_reference = true;
+
+        ALOGV("%s: hw_echo_reference is true", __func__);
+    }
+
+    return 0;
+}
+#endif
+
+static int get_playback_delay(struct stream_out *out,
+                       size_t frames,
+                       struct echo_reference_buffer *buffer)
+{
+    unsigned int kernel_frames;
+    int status;
+    int primary_pcm = 0;
+    struct pcm_device *pcm_device;
+
+    pcm_device = node_to_item(list_head(&out->pcm_dev_list),
+                              struct pcm_device, stream_list_node);
+
+    status = pcm_get_htimestamp(pcm_device->pcm, &kernel_frames, &buffer->time_stamp);
+    if (status < 0) {
+        buffer->time_stamp.tv_sec  = 0;
+        buffer->time_stamp.tv_nsec = 0;
+        buffer->delay_ns           = 0;
+        ALOGV("get_playback_delay(): pcm_get_htimestamp error,"
+                "setting playbackTimestamp to 0");
+        return status;
+    }
+
+    kernel_frames = pcm_get_buffer_size(pcm_device->pcm) - kernel_frames;
+
+    /* adjust render time stamp with delay added by current driver buffer.
+     * Add the duration of current frame as we want the render time of the last
+     * sample being written. */
+    buffer->delay_ns = (long)(((int64_t)(kernel_frames + frames)* 1000000000)/
+                            out->config.rate);
+    ALOGVV("get_playback_delay_time_stamp Secs: [%10ld], nSecs: [%9ld], kernel_frames: [%5u], delay_ns: [%d],",
+         buffer->time_stamp.tv_sec, buffer->time_stamp.tv_nsec, kernel_frames, buffer->delay_ns);
+
+    return 0;
+}
+
+#define GET_COMMAND_STATUS(status, fct_status, cmd_status) \
+            do {                                           \
+                if (fct_status != 0)                       \
+                    status = fct_status;                   \
+                else if (cmd_status != 0)                  \
+                    status = cmd_status;                   \
+            } while(0)
+
+static int in_configure_reverse(struct stream_in *in)
+{
+    int32_t cmd_status;
+    uint32_t size = sizeof(int);
+    effect_config_t config;
+    int32_t status = 0;
+    int32_t fct_status = 0;
+    int i;
+    ALOGV("%s: enter: in->num_preprocessors(%d)", __func__, in->num_preprocessors);
+    if (in->num_preprocessors > 0) {
+        config.inputCfg.channels = in->main_channels;
+        config.outputCfg.channels = in->main_channels;
+        config.inputCfg.format = AUDIO_FORMAT_PCM_16_BIT;
+        config.outputCfg.format = AUDIO_FORMAT_PCM_16_BIT;
+        config.inputCfg.samplingRate = in->requested_rate;
+        config.outputCfg.samplingRate = in->requested_rate;
+        config.inputCfg.mask =
+                ( EFFECT_CONFIG_SMP_RATE | EFFECT_CONFIG_CHANNELS | EFFECT_CONFIG_FORMAT );
+        config.outputCfg.mask =
+                ( EFFECT_CONFIG_SMP_RATE | EFFECT_CONFIG_CHANNELS | EFFECT_CONFIG_FORMAT );
+
+        for (i = 0; i < in->num_preprocessors; i++)
+        {
+            if ((*in->preprocessors[i].effect_itfe)->process_reverse == NULL)
+                continue;
+            fct_status = (*(in->preprocessors[i].effect_itfe))->command(
+                                                        in->preprocessors[i].effect_itfe,
+                                                        EFFECT_CMD_SET_CONFIG_REVERSE,
+                                                        sizeof(effect_config_t),
+                                                        &config,
+                                                        &size,
+                                                        &cmd_status);
+            ALOGV("%s: calling EFFECT_CMD_SET_CONFIG_REVERSE",__func__);
+            GET_COMMAND_STATUS(status, fct_status, cmd_status);
+        }
+    }
+    return status;
+}
+
+#define MAX_NUM_CHANNEL_CONFIGS 10
+
+static void in_read_audio_effect_channel_configs(struct stream_in *in __unused,
+                                                 struct effect_info_s *effect_info)
+{
+    /* size and format of the cmd are defined in hardware/audio_effect.h */
+    effect_handle_t effect = effect_info->effect_itfe;
+    uint32_t cmd_size = 2 * sizeof(uint32_t);
+    uint32_t cmd[] = { EFFECT_FEATURE_AUX_CHANNELS, MAX_NUM_CHANNEL_CONFIGS };
+    /* reply = status + number of configs (n) + n x channel_config_t */
+    uint32_t reply_size =
+            2 * sizeof(uint32_t) + (MAX_NUM_CHANNEL_CONFIGS * sizeof(channel_config_t));
+    int32_t reply[reply_size];
+    int32_t cmd_status;
+
+    ALOG_ASSERT((effect_info->num_channel_configs == 0),
+                "in_read_audio_effect_channel_configs() num_channel_configs not cleared");
+    ALOG_ASSERT((effect_info->channel_configs == NULL),
+                "in_read_audio_effect_channel_configs() channel_configs not cleared");
+
+    /* if this command is not supported, then the effect is supposed to return -EINVAL.
+     * This error will be interpreted as if the effect supports the main_channels but does not
+     * support any aux_channels */
+    cmd_status = (*effect)->command(effect,
+                                EFFECT_CMD_GET_FEATURE_SUPPORTED_CONFIGS,
+                                cmd_size,
+                                (void*)&cmd,
+                                &reply_size,
+                                (void*)&reply);
+
+    if (cmd_status != 0) {
+        ALOGV("in_read_audio_effect_channel_configs(): "
+                "fx->command returned %d", cmd_status);
+        return;
+    }
+
+    if (reply[0] != 0) {
+        ALOGW("in_read_audio_effect_channel_configs(): "
+                "command EFFECT_CMD_GET_FEATURE_SUPPORTED_CONFIGS error %d num configs %d",
+                reply[0], (reply[0] == -ENOMEM) ? reply[1] : MAX_NUM_CHANNEL_CONFIGS);
+        return;
+    }
+
+    /* the feature is not supported */
+    ALOGV("in_read_audio_effect_channel_configs()(): "
+            "Feature supported and adding %d channel configs to the list", reply[1]);
+    effect_info->num_channel_configs = reply[1];
+    effect_info->channel_configs =
+            (channel_config_t *) malloc(sizeof(channel_config_t) * reply[1]); /* n x configs */
+    memcpy(effect_info->channel_configs, (reply + 2), sizeof(channel_config_t) * reply[1]);
+}
+
+
+#define NUM_IN_AUX_CNL_CONFIGS 2
+static const channel_config_t in_aux_cnl_configs[NUM_IN_AUX_CNL_CONFIGS] = {
+    { AUDIO_CHANNEL_IN_FRONT , AUDIO_CHANNEL_IN_BACK},
+    { AUDIO_CHANNEL_IN_STEREO , AUDIO_CHANNEL_IN_RIGHT}
+};
+static uint32_t in_get_aux_channels(struct stream_in *in)
+{
+    int i;
+    channel_config_t new_chcfg = {0, 0};
+
+    if (in->num_preprocessors == 0)
+        return 0;
+
+    /* do not enable dual mic configurations when capturing from other microphones than
+     * main or sub */
+    if (!(in->devices & (AUDIO_DEVICE_IN_BUILTIN_MIC | AUDIO_DEVICE_IN_BACK_MIC)))
+        return 0;
+
+    /* retain most complex aux channels configuration compatible with requested main channels and
+     * supported by audio driver and all pre processors */
+    for (i = 0; i < NUM_IN_AUX_CNL_CONFIGS; i++) {
+        const channel_config_t *cur_chcfg = &in_aux_cnl_configs[i];
+        if (cur_chcfg->main_channels == in->main_channels) {
+            size_t match_cnt;
+            size_t idx_preproc;
+            for (idx_preproc = 0, match_cnt = 0;
+                 /* no need to continue if at least one preprocessor doesn't match */
+                 idx_preproc < (size_t)in->num_preprocessors && match_cnt == idx_preproc;
+                 idx_preproc++) {
+                struct effect_info_s *effect_info = &in->preprocessors[idx_preproc];
+                size_t idx_chcfg;
+
+                for (idx_chcfg = 0; idx_chcfg < effect_info->num_channel_configs; idx_chcfg++) {
+                    if (memcmp(effect_info->channel_configs + idx_chcfg,
+                               cur_chcfg,
+                               sizeof(channel_config_t)) == 0) {
+                        match_cnt++;
+                        break;
+                    }
+                }
+            }
+            /* if all preprocessors match, we have a candidate */
+            if (match_cnt == (size_t)in->num_preprocessors) {
+                /* retain most complex aux channels configuration */
+                if (audio_channel_count_from_in_mask(cur_chcfg->aux_channels) > audio_channel_count_from_in_mask(new_chcfg.aux_channels)) {
+                    new_chcfg = *cur_chcfg;
+                }
+            }
+        }
+    }
+
+    ALOGV("in_get_aux_channels(): return %04x", new_chcfg.aux_channels);
+
+    return new_chcfg.aux_channels;
+}
+
+static int in_configure_effect_channels(effect_handle_t effect,
+                                        channel_config_t *channel_config)
+{
+    int status = 0;
+    int fct_status;
+    int32_t cmd_status;
+    uint32_t reply_size;
+    effect_config_t config;
+    uint32_t cmd[(sizeof(uint32_t) + sizeof(channel_config_t) - 1) / sizeof(uint32_t) + 1];
+
+    ALOGV("in_configure_effect_channels(): configure effect with channels: [%04x][%04x]",
+            channel_config->main_channels,
+            channel_config->aux_channels);
+
+    config.inputCfg.mask = EFFECT_CONFIG_CHANNELS;
+    config.outputCfg.mask = EFFECT_CONFIG_CHANNELS;
+    reply_size = sizeof(effect_config_t);
+    fct_status = (*effect)->command(effect,
+                                EFFECT_CMD_GET_CONFIG,
+                                0,
+                                NULL,
+                                &reply_size,
+                                &config);
+    if (fct_status != 0) {
+        ALOGE("in_configure_effect_channels(): EFFECT_CMD_GET_CONFIG failed");
+        return fct_status;
+    }
+
+    config.inputCfg.channels = channel_config->main_channels | channel_config->aux_channels;
+    config.outputCfg.channels = config.inputCfg.channels;
+    reply_size = sizeof(uint32_t);
+    fct_status = (*effect)->command(effect,
+                                    EFFECT_CMD_SET_CONFIG,
+                                    sizeof(effect_config_t),
+                                    &config,
+                                    &reply_size,
+                                    &cmd_status);
+    GET_COMMAND_STATUS(status, fct_status, cmd_status);
+
+    cmd[0] = EFFECT_FEATURE_AUX_CHANNELS;
+    memcpy(cmd + 1, channel_config, sizeof(channel_config_t));
+    reply_size = sizeof(uint32_t);
+    fct_status = (*effect)->command(effect,
+                                EFFECT_CMD_SET_FEATURE_CONFIG,
+                                sizeof(cmd), //sizeof(uint32_t) + sizeof(channel_config_t),
+                                cmd,
+                                &reply_size,
+                                &cmd_status);
+    GET_COMMAND_STATUS(status, fct_status, cmd_status);
+
+    /* some implementations need to be re-enabled after a config change */
+    reply_size = sizeof(uint32_t);
+    fct_status = (*effect)->command(effect,
+                                  EFFECT_CMD_ENABLE,
+                                  0,
+                                  NULL,
+                                  &reply_size,
+                                  &cmd_status);
+    GET_COMMAND_STATUS(status, fct_status, cmd_status);
+
+    return status;
+}
+
+static int in_reconfigure_channels(struct stream_in *in,
+                                   effect_handle_t effect,
+                                   channel_config_t *channel_config,
+                                   bool config_changed) {
+
+    int status = 0;
+
+    ALOGV("in_reconfigure_channels(): config_changed %d effect %p",
+          config_changed, effect);
+
+    /* if config changed, reconfigure all previously added effects */
+    if (config_changed) {
+        int i;
+        ALOGV("%s: config_changed (%d)", __func__, config_changed);
+        for (i = 0; i < in->num_preprocessors; i++)
+        {
+            int cur_status = in_configure_effect_channels(in->preprocessors[i].effect_itfe,
+                                                  channel_config);
+            ALOGV("%s: in_configure_effect_channels i=(%d), [main_channel,aux_channel]=[%d|%d], status=%d",
+                          __func__, i, channel_config->main_channels, channel_config->aux_channels, cur_status);
+            if (cur_status != 0) {
+                ALOGV("in_reconfigure_channels(): error %d configuring effect "
+                        "%d with channels: [%04x][%04x]",
+                        cur_status,
+                        i,
+                        channel_config->main_channels,
+                        channel_config->aux_channels);
+                status = cur_status;
+            }
+        }
+    } else if (effect != NULL && channel_config->aux_channels) {
+        /* if aux channels config did not change but aux channels are present,
+         * we still need to configure the effect being added */
+        status = in_configure_effect_channels(effect, channel_config);
+    }
+    return status;
+}
+
+static void in_update_aux_channels(struct stream_in *in,
+                                   effect_handle_t effect)
+{
+    uint32_t aux_channels;
+    channel_config_t channel_config;
+    int status;
+
+    aux_channels = in_get_aux_channels(in);
+
+    channel_config.main_channels = in->main_channels;
+    channel_config.aux_channels = aux_channels;
+    status = in_reconfigure_channels(in,
+                                     effect,
+                                     &channel_config,
+                                     (aux_channels != in->aux_channels));
+
+    if (status != 0) {
+        ALOGV("in_update_aux_channels(): in_reconfigure_channels error %d", status);
+        /* resetting aux channels configuration */
+        aux_channels = 0;
+        channel_config.aux_channels = 0;
+        in_reconfigure_channels(in, effect, &channel_config, true);
+    }
+    ALOGV("%s: aux_channels=%d, in->aux_channels_changed=%d", __func__, aux_channels, in->aux_channels_changed);
+    if (in->aux_channels != aux_channels) {
+        in->aux_channels_changed = true;
+        in->aux_channels = aux_channels;
+        do_in_standby_l(in);
+    }
+}
+#endif
+
+/* This function reads PCM data and:
+ * - resample if needed
+ * - process if pre-processors are attached
+ * - discard unwanted channels
+ */
+static ssize_t read_and_process_frames(struct stream_in *in, void* buffer, ssize_t frames)
+{
+    ssize_t frames_wr = 0;
+    audio_buffer_t in_buf;
+    audio_buffer_t out_buf;
+    size_t src_channels = in->config.channels;
+    size_t dst_channels = audio_channel_count_from_in_mask(in->main_channels);
+    int i;
+    void *proc_buf_out;
+    struct pcm_device *pcm_device;
+    bool has_additional_channels = (dst_channels != src_channels) ? true : false;
+#ifdef PREPROCESSING_ENABLED
+    bool has_processing = (in->num_preprocessors != 0) ? true : false;
+#endif
+
+    /* Additional channels might be added on top of main_channels:
+    * - aux_channels (by processing effects)
+    * - extra channels due to HW limitations
+    * In case of additional channels, we cannot work inplace
+    */
+    if (has_additional_channels)
+        proc_buf_out = in->proc_buf_out;
+    else
+        proc_buf_out = buffer;
+
+    if (list_empty(&in->pcm_dev_list)) {
+        ALOGE("%s: pcm device list empty", __func__);
+        return -EINVAL;
+    }
+
+    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
+                              struct pcm_device, stream_list_node);
+
+#ifdef PREPROCESSING_ENABLED
+    if (has_processing) {
+        /* since all the processing below is done in frames and using the config.channels
+         * as the number of channels, no changes is required in case aux_channels are present */
+        while (frames_wr < frames) {
+            /* first reload enough frames at the end of process input buffer */
+            if (in->proc_buf_frames < (size_t)frames) {
+                ssize_t frames_rd;
+                if (in->proc_buf_size < (size_t)frames) {
+                    size_t size_in_bytes = pcm_frames_to_bytes(pcm_device->pcm, frames);
+                    in->proc_buf_size = (size_t)frames;
+                    in->proc_buf_in = (int16_t *)realloc(in->proc_buf_in, size_in_bytes);
+                    ALOG_ASSERT((in->proc_buf_in != NULL),
+                                "process_frames() failed to reallocate proc_buf_in");
+                    if (has_additional_channels) {
+                        in->proc_buf_out = (int16_t *)realloc(in->proc_buf_out, size_in_bytes);
+                        ALOG_ASSERT((in->proc_buf_out != NULL),
+                                    "process_frames() failed to reallocate proc_buf_out");
+                        proc_buf_out = in->proc_buf_out;
+                    }
+                }
+                frames_rd = read_frames(in,
+                                        in->proc_buf_in +
+                                            in->proc_buf_frames * in->config.channels,
+                                        frames - in->proc_buf_frames);
+                  if (frames_rd < 0) {
+                    /* Return error code */
+                    frames_wr = frames_rd;
+                    break;
+                }
+                in->proc_buf_frames += frames_rd;
+            }
+
+            if (in->echo_reference != NULL) {
+                push_echo_reference(in, in->proc_buf_frames);
+            }
+
+             /* in_buf.frameCount and out_buf.frameCount indicate respectively
+              * the maximum number of frames to be consumed and produced by process() */
+            in_buf.frameCount = in->proc_buf_frames;
+            in_buf.s16 = in->proc_buf_in;
+            out_buf.frameCount = frames - frames_wr;
+            out_buf.s16 = (int16_t *)proc_buf_out + frames_wr * in->config.channels;
+
+            /* FIXME: this works because of current pre processing library implementation that
+             * does the actual process only when the last enabled effect process is called.
+             * The generic solution is to have an output buffer for each effect and pass it as
+             * input to the next.
+             */
+            for (i = 0; i < in->num_preprocessors; i++) {
+                (*in->preprocessors[i].effect_itfe)->process(in->preprocessors[i].effect_itfe,
+                                                   &in_buf,
+                                                   &out_buf);
+            }
+
+            /* process() has updated the number of frames consumed and produced in
+             * in_buf.frameCount and out_buf.frameCount respectively
+             * move remaining frames to the beginning of in->proc_buf_in */
+            in->proc_buf_frames -= in_buf.frameCount;
+
+            if (in->proc_buf_frames) {
+                memcpy(in->proc_buf_in,
+                       in->proc_buf_in + in_buf.frameCount * in->config.channels,
+                       in->proc_buf_frames * in->config.channels * sizeof(int16_t));
+            }
+
+            /* if not enough frames were passed to process(), read more and retry. */
+            if (out_buf.frameCount == 0) {
+                ALOGW("No frames produced by preproc");
+                continue;
+            }
+
+            if ((frames_wr + (ssize_t)out_buf.frameCount) <= frames) {
+                frames_wr += out_buf.frameCount;
+            } else {
+                /* The effect does not comply to the API. In theory, we should never end up here! */
+                ALOGE("preprocessing produced too many frames: %d + %zd  > %d !",
+                      (unsigned int)frames_wr, out_buf.frameCount, (unsigned int)frames);
+                frames_wr = frames;
+            }
+        }
+    }
+    else
+#endif //PREPROCESSING_ENABLED
+    {
+        /* No processing effects attached */
+        if (has_additional_channels) {
+            /* With additional channels, we cannot use original buffer */
+            if (in->proc_buf_size < (size_t)frames) {
+                size_t size_in_bytes = pcm_frames_to_bytes(pcm_device->pcm, frames);
+                in->proc_buf_size = (size_t)frames;
+                in->proc_buf_out = (int16_t *)realloc(in->proc_buf_out, size_in_bytes);
+                ALOG_ASSERT((in->proc_buf_out != NULL),
+                            "process_frames() failed to reallocate proc_buf_out");
+                proc_buf_out = in->proc_buf_out;
+            }
+        }
+        frames_wr = read_frames(in, proc_buf_out, frames);
+    }
+
+    /* Remove all additional channels that have been added on top of main_channels:
+     * - aux_channels
+     * - extra channels from HW due to HW limitations
+     * Assumption is made that the channels are interleaved and that the main
+     * channels are first. */
+
+    if (has_additional_channels)
+    {
+        int16_t* src_buffer = (int16_t *)proc_buf_out;
+        int16_t* dst_buffer = (int16_t *)buffer;
+
+        if (dst_channels == 1) {
+            for (i = frames_wr; i > 0; i--)
+            {
+                *dst_buffer++ = *src_buffer;
+                src_buffer += src_channels;
+            }
+        } else {
+            for (i = frames_wr; i > 0; i--)
+            {
+                memcpy(dst_buffer, src_buffer, dst_channels*sizeof(int16_t));
+                dst_buffer += dst_channels;
+                src_buffer += src_channels;
+            }
+        }
+    }
+
+    return frames_wr;
+}
+
+static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
+                                   struct resampler_buffer* buffer)
+{
+    struct stream_in *in;
+    struct pcm_device *pcm_device;
+
+    if (buffer_provider == NULL || buffer == NULL)
+        return -EINVAL;
+
+    in = (struct stream_in *)((char *)buffer_provider -
+                                   offsetof(struct stream_in, buf_provider));
+
+    if (list_empty(&in->pcm_dev_list)) {
+        buffer->raw = NULL;
+        buffer->frame_count = 0;
+        in->read_status = -ENODEV;
+        return -ENODEV;
+    }
+
+    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
+                              struct pcm_device, stream_list_node);
+
+    if (in->read_buf_frames == 0) {
+        size_t size_in_bytes = pcm_frames_to_bytes(pcm_device->pcm, in->config.period_size);
+        if (in->read_buf_size < in->config.period_size) {
+            in->read_buf_size = in->config.period_size;
+            in->read_buf = (int16_t *) realloc(in->read_buf, size_in_bytes);
+            ALOG_ASSERT((in->read_buf != NULL),
+                        "get_next_buffer() failed to reallocate read_buf");
+        }
+
+        in->read_status = pcm_read(pcm_device->pcm, (void*)in->read_buf, size_in_bytes);
+
+        if (in->read_status != 0) {
+            ALOGE("get_next_buffer() pcm_read error %d", in->read_status);
+            buffer->raw = NULL;
+            buffer->frame_count = 0;
+            return in->read_status;
+        }
+        in->read_buf_frames = in->config.period_size;
+
+#ifdef PREPROCESSING_ENABLED
+#ifdef HW_AEC_LOOPBACK
+        if (in->hw_echo_reference) {
+            struct pcm_device *temp_device = NULL;
+            struct pcm_device *ref_device = NULL;
+            struct listnode *node = NULL;
+            struct echo_reference_buffer b;
+            size_t size_hw_ref_bytes;
+            size_t size_hw_ref_frames;
+            int read_status = 0;
+
+            ref_device = node_to_item(list_tail(&in->pcm_dev_list),
+                                      struct pcm_device, stream_list_node);
+            list_for_each(node, &in->pcm_dev_list) {
+                temp_device = node_to_item(node, struct pcm_device, stream_list_node);
+                if (temp_device->pcm_profile->id == 1) {
+                    ref_device = temp_device;
+                    break;
+                }
+            }
+            if (ref_device) {
+                size_hw_ref_bytes = pcm_frames_to_bytes(ref_device->pcm, ref_device->pcm_profile->config.period_size);
+                size_hw_ref_frames = ref_device->pcm_profile->config.period_size;
+                if (in->hw_ref_buf_size < size_hw_ref_frames) {
+                    in->hw_ref_buf_size = size_hw_ref_frames;
+                    in->hw_ref_buf = (int16_t *) realloc(in->hw_ref_buf, size_hw_ref_bytes);
+                    ALOG_ASSERT((in->hw_ref_buf != NULL),
+                                "get_next_buffer() failed to reallocate hw_ref_buf");
+                    ALOGV("get_next_buffer(): hw_ref_buf %p extended to %zd bytes",
+                          in->hw_ref_buf, size_hw_ref_bytes);
+                }
+
+                read_status = pcm_read(ref_device->pcm, (void*)in->hw_ref_buf, size_hw_ref_bytes);
+                if (read_status != 0) {
+                    ALOGE("process_frames() pcm_read error for HW reference %d", read_status);
+                    b.raw = NULL;
+                    b.frame_count = 0;
+                }
+                else {
+                    get_capture_reference_delay(in, size_hw_ref_frames, &b);
+                    b.raw = (void *)in->hw_ref_buf;
+                    b.frame_count = size_hw_ref_frames;
+                    if (b.delay_ns != 0)
+                        b.delay_ns = -b.delay_ns; // as this is capture delay, it needs to be subtracted from the microphone delay
+                    in->echo_reference->write(in->echo_reference, &b);
+                }
+            }
+        }
+#endif // HW_AEC_LOOPBACK
+#endif // PREPROCESSING_ENABLED
+    }
+
+    buffer->frame_count = (buffer->frame_count > in->read_buf_frames) ?
+                                in->read_buf_frames : buffer->frame_count;
+    buffer->i16 = in->read_buf + (in->config.period_size - in->read_buf_frames) *
+                                                in->config.channels;
+    return in->read_status;
+}
+
+static void release_buffer(struct resampler_buffer_provider *buffer_provider,
+                                  struct resampler_buffer* buffer)
+{
+    struct stream_in *in;
+
+    if (buffer_provider == NULL || buffer == NULL)
+        return;
+
+    in = (struct stream_in *)((char *)buffer_provider -
+                                   offsetof(struct stream_in, buf_provider));
+
+    in->read_buf_frames -= buffer->frame_count;
+}
+
+/* read_frames() reads frames from kernel driver, down samples to capture rate
+ * if necessary and output the number of frames requested to the buffer specified */
+static ssize_t read_frames(struct stream_in *in, void *buffer, ssize_t frames)
+{
+    ssize_t frames_wr = 0;
+
+    struct pcm_device *pcm_device;
+
+    if (list_empty(&in->pcm_dev_list)) {
+        ALOGE("%s: pcm device list empty", __func__);
+        return -EINVAL;
+    }
+
+    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
+                              struct pcm_device, stream_list_node);
+
+    while (frames_wr < frames) {
+        size_t frames_rd = frames - frames_wr;
+        ALOGVV("%s: frames_rd: %zd, frames_wr: %zd, in->config.channels: %d",
+               __func__,frames_rd,frames_wr,in->config.channels);
+        if (in->resampler != NULL) {
+            in->resampler->resample_from_provider(in->resampler,
+                    (int16_t *)((char *)buffer +
+                            pcm_frames_to_bytes(pcm_device->pcm, frames_wr)),
+                    &frames_rd);
+        } else {
+            struct resampler_buffer buf = {
+                    { raw : NULL, },
+                    frame_count : frames_rd,
+            };
+            get_next_buffer(&in->buf_provider, &buf);
+            if (buf.raw != NULL) {
+                memcpy((char *)buffer +
+                            pcm_frames_to_bytes(pcm_device->pcm, frames_wr),
+                        buf.raw,
+                        pcm_frames_to_bytes(pcm_device->pcm, buf.frame_count));
+                frames_rd = buf.frame_count;
+            }
+            release_buffer(&in->buf_provider, &buf);
+        }
+        /* in->read_status is updated by getNextBuffer() also called by
+         * in->resampler->resample_from_provider() */
+        if (in->read_status != 0)
+            return in->read_status;
+
+        frames_wr += frames_rd;
+    }
+    return frames_wr;
+}
+
+static int in_release_pcm_devices(struct stream_in *in)
+{
+    struct pcm_device *pcm_device;
+    struct listnode *node;
+    struct listnode *next;
+
+    list_for_each_safe(node, next, &in->pcm_dev_list) {
+        pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
+        list_remove(node);
+        free(pcm_device);
+    }
+
+    return 0;
+}
+
+static int stop_input_stream(struct stream_in *in)
+{
+    struct audio_usecase *uc_info;
+    struct audio_device *adev = in->dev;
+
+    adev->active_input = NULL;
+    ALOGV("%s: enter: usecase(%d: %s)", __func__,
+          in->usecase, use_case_table[in->usecase]);
+    uc_info = get_usecase_from_id(adev, in->usecase);
+    if (uc_info == NULL) {
+        ALOGE("%s: Could not find the usecase (%d) in the list",
+              __func__, in->usecase);
+        return -EINVAL;
+    }
+
+    /* Disable the tx device */
+    disable_snd_device(adev, uc_info, uc_info->in_snd_device, true);
+
+    list_remove(&uc_info->adev_list_node);
+    free(uc_info);
+
+    if (list_empty(&in->pcm_dev_list)) {
+        ALOGE("%s: pcm device list empty", __func__);
+        return -EINVAL;
+    }
+
+    in_release_pcm_devices(in);
+    list_init(&in->pcm_dev_list);
+
+#ifdef HW_AEC_LOOPBACK
+    if (in->hw_echo_reference)
+    {
+        in->hw_echo_reference = false;
+    }
+#endif
+
+    ALOGV("%s: exit", __func__);
+    return 0;
+}
+
+static int start_input_stream(struct stream_in *in)
+{
+    /* Enable output device and stream routing controls */
+    int ret = 0;
+    bool recreate_resampler = false;
+    struct audio_usecase *uc_info;
+    struct audio_device *adev = in->dev;
+    struct pcm_device_profile *pcm_profile;
+    struct pcm_device *pcm_device;
+
+    ALOGV("%s: enter: usecase(%d)", __func__, in->usecase);
+    adev->active_input = in;
+    pcm_profile = get_pcm_device(in->usecase_type, in->devices);
+    if (pcm_profile == NULL) {
+        ALOGE("%s: Could not find PCM device id for the usecase(%d)",
+              __func__, in->usecase);
+        ret = -EINVAL;
+        goto error_config;
+    }
+
+    uc_info = (struct audio_usecase *)calloc(1, sizeof(struct audio_usecase));
+    uc_info->id = in->usecase;
+    uc_info->type = PCM_CAPTURE;
+    uc_info->stream = (struct audio_stream *)in;
+    uc_info->devices = in->devices;
+    uc_info->in_snd_device = SND_DEVICE_NONE;
+    uc_info->out_snd_device = SND_DEVICE_NONE;
+
+    pcm_device = (struct pcm_device *)calloc(1, sizeof(struct pcm_device));
+    pcm_device->pcm_profile = pcm_profile;
+    list_init(&in->pcm_dev_list);
+    list_add_tail(&in->pcm_dev_list, &pcm_device->stream_list_node);
+
+    list_init(&uc_info->mixer_list);
+    list_add_tail(&uc_info->mixer_list,
+                  &adev_get_mixer_for_card(adev,
+                                       pcm_device->pcm_profile->card)->uc_list_node[uc_info->id]);
+
+    list_add_tail(&adev->usecase_list, &uc_info->adev_list_node);
+
+    select_devices(adev, in->usecase);
+
+    /* Config should be updated as profile can be changed between different calls
+     * to this function:
+     * - Trigger resampler creation
+     * - Config needs to be updated */
+    if (in->config.rate != pcm_profile->config.rate) {
+        recreate_resampler = true;
+    }
+    in->config = pcm_profile->config;
+
+#ifdef PREPROCESSING_ENABLED
+    if (in->aux_channels_changed) {
+        in->config.channels = audio_channel_count_from_in_mask(in->main_channels | in->aux_channels);
+        recreate_resampler = true;
+    }
+#endif
+
+    if (in->requested_rate != in->config.rate) {
+        recreate_resampler = true;
+    }
+
+    if (recreate_resampler) {
+        if (in->resampler) {
+            release_resampler(in->resampler);
+            in->resampler = NULL;
+        }
+        in->buf_provider.get_next_buffer = get_next_buffer;
+        in->buf_provider.release_buffer = release_buffer;
+        ret = create_resampler(in->config.rate,
+                               in->requested_rate,
+                               in->config.channels,
+                               RESAMPLER_QUALITY_DEFAULT,
+                               &in->buf_provider,
+                               &in->resampler);
+    }
+
+#ifdef PREPROCESSING_ENABLED
+    if (in->enable_aec && in->echo_reference == NULL) {
+        in->echo_reference = get_echo_reference(adev,
+                                                AUDIO_FORMAT_PCM_16_BIT,
+                                                audio_channel_count_from_in_mask(in->main_channels),
+                                                in->requested_rate
+                                                );
+    }
+
+#ifdef HW_AEC_LOOPBACK
+    if (in->enable_aec) {
+        ret = get_hw_echo_reference(in);
+        if (ret!=0)
+            goto error_open;
+
+        /* force ref buffer reallocation */
+        in->hw_ref_buf_size = 0;
+    }
+#endif
+#endif
+
+    /* Open the PCM device.
+     * The HW is limited to support only the default pcm_profile settings.
+     * As such a change in aux_channels will not have an effect.
+     */
+    ALOGV("%s: Opening PCM device card_id(%d) device_id(%d), channels %d, smp rate %d format %d, \
+          period_size %d", __func__, pcm_device->pcm_profile->card, pcm_device->pcm_profile->id,
+          pcm_device->pcm_profile->config.channels,pcm_device->pcm_profile->config.rate,
+          pcm_device->pcm_profile->config.format, pcm_device->pcm_profile->config.period_size);
+
+    if (pcm_profile->type == PCM_HOTWORD_STREAMING) {
+        if (!adev->sound_trigger_open_for_streaming) {
+            ALOGE("%s: No handle to sound trigger HAL", __func__);
+            ret = -EIO;
+            goto error_open;
+        }
+        pcm_device->pcm = NULL;
+        pcm_device->sound_trigger_handle = adev->sound_trigger_open_for_streaming();
+        if (pcm_device->sound_trigger_handle <= 0) {
+            ALOGE("%s: Failed to open DSP for streaming", __func__);
+            ret = -EIO;
+            goto error_open;
+        }
+        ALOGV("Opened DSP successfully");
+    } else {
+        pcm_device->sound_trigger_handle = 0;
+        pcm_device->pcm = pcm_open(pcm_device->pcm_profile->card, pcm_device->pcm_profile->id,
+                                   PCM_IN | PCM_MONOTONIC, &pcm_device->pcm_profile->config);
+
+        if (pcm_device->pcm && !pcm_is_ready(pcm_device->pcm)) {
+            ALOGE("%s: %s", __func__, pcm_get_error(pcm_device->pcm));
+            pcm_close(pcm_device->pcm);
+            pcm_device->pcm = NULL;
+            ret = -EIO;
+            goto error_open;
+        }
+    }
+
+    /* force read and proc buffer reallocation in case of frame size or
+     * channel count change */
+    in->proc_buf_frames = 0;
+    in->proc_buf_size = 0;
+    in->read_buf_size = 0;
+    in->read_buf_frames = 0;
+
+    /* if no supported sample rate is available, use the resampler */
+    if (in->resampler) {
+        in->resampler->reset(in->resampler);
+    }
+
+    ALOGV("%s: exit", __func__);
+    return ret;
+
+error_open:
+    if (in->resampler) {
+        release_resampler(in->resampler);
+        in->resampler = NULL;
+    }
+    stop_input_stream(in);
+
+error_config:
+    ALOGV("%s: exit: status(%d)", __func__, ret);
+    adev->active_input = NULL;
     return ret;
 }
 
-/*********************************************************************
- * Output stream common functions
- *********************************************************************/
+void lock_input_stream(struct stream_in *in)
+{
+    pthread_mutex_lock(&in->pre_lock);
+    pthread_mutex_lock(&in->lock);
+    pthread_mutex_unlock(&in->pre_lock);
+}
+
+void lock_output_stream(struct stream_out *out)
+{
+    pthread_mutex_lock(&out->pre_lock);
+    pthread_mutex_lock(&out->lock);
+    pthread_mutex_unlock(&out->pre_lock);
+}
+
+
+/* must be called with out->lock locked */
+static int send_offload_cmd_l(struct stream_out* out, int command)
+{
+    struct offload_cmd *cmd = (struct offload_cmd *)calloc(1, sizeof(struct offload_cmd));
+
+    ALOGVV("%s %d", __func__, command);
+
+    cmd->cmd = command;
+    list_add_tail(&out->offload_cmd_list, &cmd->node);
+    pthread_cond_signal(&out->offload_cond);
+    return 0;
+}
+
+/* must be called iwth out->lock locked */
+static void stop_compressed_output_l(struct stream_out *out)
+{
+    out->send_new_metadata = 1;
+    if (out->compr != NULL) {
+        compress_stop(out->compr);
+        while (out->offload_thread_blocked) {
+            pthread_cond_wait(&out->cond, &out->lock);
+        }
+    }
+}
+
+static void *offload_thread_loop(void *context)
+{
+    struct stream_out *out = (struct stream_out *) context;
+    struct listnode *item;
+
+    setpriority(PRIO_PROCESS, 0, ANDROID_PRIORITY_AUDIO);
+    set_sched_policy(0, SP_FOREGROUND);
+    prctl(PR_SET_NAME, (unsigned long)"Offload Callback", 0, 0, 0);
+
+    ALOGV("%s", __func__);
+    lock_output_stream(out);
+    for (;;) {
+        struct offload_cmd *cmd = NULL;
+        stream_callback_event_t event;
+        bool send_callback = false;
+
+        ALOGVV("%s offload_cmd_list %d out->offload_state %d",
+              __func__, list_empty(&out->offload_cmd_list),
+              out->offload_state);
+        if (list_empty(&out->offload_cmd_list)) {
+            ALOGV("%s SLEEPING", __func__);
+            pthread_cond_wait(&out->offload_cond, &out->lock);
+            ALOGV("%s RUNNING", __func__);
+            continue;
+        }
+
+        item = list_head(&out->offload_cmd_list);
+        cmd = node_to_item(item, struct offload_cmd, node);
+        list_remove(item);
+
+        ALOGVV("%s STATE %d CMD %d out->compr %p",
+               __func__, out->offload_state, cmd->cmd, out->compr);
+
+        if (cmd->cmd == OFFLOAD_CMD_EXIT) {
+            free(cmd);
+            break;
+        }
+
+        if (out->compr == NULL) {
+            ALOGE("%s: Compress handle is NULL", __func__);
+            pthread_cond_signal(&out->cond);
+            continue;
+        }
+        out->offload_thread_blocked = true;
+        pthread_mutex_unlock(&out->lock);
+        send_callback = false;
+        switch(cmd->cmd) {
+        case OFFLOAD_CMD_WAIT_FOR_BUFFER:
+            compress_wait(out->compr, -1);
+            send_callback = true;
+            event = STREAM_CBK_EVENT_WRITE_READY;
+            break;
+        case OFFLOAD_CMD_PARTIAL_DRAIN:
+            compress_next_track(out->compr);
+            compress_partial_drain(out->compr);
+            send_callback = true;
+            event = STREAM_CBK_EVENT_DRAIN_READY;
+            break;
+        case OFFLOAD_CMD_DRAIN:
+            compress_drain(out->compr);
+            send_callback = true;
+            event = STREAM_CBK_EVENT_DRAIN_READY;
+            break;
+        default:
+            ALOGE("%s unknown command received: %d", __func__, cmd->cmd);
+            break;
+        }
+        lock_output_stream(out);
+        out->offload_thread_blocked = false;
+        pthread_cond_signal(&out->cond);
+        if (send_callback) {
+            out->offload_callback(event, NULL, out->offload_cookie);
+        }
+        free(cmd);
+    }
+
+    pthread_cond_signal(&out->cond);
+    while (!list_empty(&out->offload_cmd_list)) {
+        item = list_head(&out->offload_cmd_list);
+        list_remove(item);
+        free(node_to_item(item, struct offload_cmd, node));
+    }
+    pthread_mutex_unlock(&out->lock);
+
+    return NULL;
+}
+
+static int create_offload_callback_thread(struct stream_out *out)
+{
+    pthread_cond_init(&out->offload_cond, (const pthread_condattr_t *) NULL);
+    list_init(&out->offload_cmd_list);
+    pthread_create(&out->offload_thread, (const pthread_attr_t *) NULL,
+                    offload_thread_loop, out);
+    return 0;
+}
+
+static int destroy_offload_callback_thread(struct stream_out *out)
+{
+    lock_output_stream(out);
+    send_offload_cmd_l(out, OFFLOAD_CMD_EXIT);
+
+    pthread_mutex_unlock(&out->lock);
+    pthread_join(out->offload_thread, (void **) NULL);
+    pthread_cond_destroy(&out->offload_cond);
+
+    return 0;
+}
+
+static int uc_release_pcm_devices(struct audio_usecase *usecase)
+{
+    struct stream_out *out = (struct stream_out *)usecase->stream;
+    struct pcm_device *pcm_device;
+    struct listnode *node;
+    struct listnode *next;
+
+    list_for_each_safe(node, next, &out->pcm_dev_list) {
+        pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
+        list_remove(node);
+        free(pcm_device);
+    }
+    list_init(&usecase->mixer_list);
+
+    return 0;
+}
+
+static int uc_select_pcm_devices(struct audio_usecase *usecase)
+
+{
+    struct stream_out *out = (struct stream_out *)usecase->stream;
+    struct pcm_device *pcm_device;
+    struct pcm_device_profile *pcm_profile;
+    struct mixer_card *mixer_card;
+    audio_devices_t devices = usecase->devices;
+
+    list_init(&usecase->mixer_list);
+    list_init(&out->pcm_dev_list);
+
+    while ((pcm_profile = get_pcm_device(usecase->type, devices)) != NULL) {
+        pcm_device = calloc(1, sizeof(struct pcm_device));
+        pcm_device->pcm_profile = pcm_profile;
+        list_add_tail(&out->pcm_dev_list, &pcm_device->stream_list_node);
+        mixer_card = uc_get_mixer_for_card(usecase, pcm_profile->card);
+        if (mixer_card == NULL) {
+            mixer_card = adev_get_mixer_for_card(out->dev, pcm_profile->card);
+            list_add_tail(&usecase->mixer_list, &mixer_card->uc_list_node[usecase->id]);
+        }
+        devices &= ~pcm_profile->devices;
+    }
+
+    return 0;
+}
+
+static int out_close_pcm_devices(struct stream_out *out)
+{
+    struct pcm_device *pcm_device;
+    struct listnode *node;
+    struct audio_device *adev = out->dev;
+
+    list_for_each(node, &out->pcm_dev_list) {
+        pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
+        if (pcm_device->sound_trigger_handle > 0) {
+            adev->sound_trigger_close_for_streaming(pcm_device->sound_trigger_handle);
+            pcm_device->sound_trigger_handle = 0;
+        }
+        if (pcm_device->pcm) {
+            pcm_close(pcm_device->pcm);
+            pcm_device->pcm = NULL;
+        }
+        if (pcm_device->resampler) {
+            release_resampler(pcm_device->resampler);
+            pcm_device->resampler = NULL;
+        }
+        if (pcm_device->res_buffer) {
+            free(pcm_device->res_buffer);
+            pcm_device->res_buffer = NULL;
+        }
+    }
+
+    return 0;
+}
+
+static int out_open_pcm_devices(struct stream_out *out)
+{
+    struct pcm_device *pcm_device;
+    struct listnode *node;
+    int ret = 0;
+
+    list_for_each(node, &out->pcm_dev_list) {
+        pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
+        ALOGV("%s: Opening PCM device card_id(%d) device_id(%d)",
+              __func__, pcm_device->pcm_profile->card, pcm_device->pcm_profile->id);
+
+        pcm_device->pcm = pcm_open(pcm_device->pcm_profile->card, pcm_device->pcm_profile->id,
+                               PCM_OUT | PCM_MONOTONIC, &pcm_device->pcm_profile->config);
+
+        if (pcm_device->pcm && !pcm_is_ready(pcm_device->pcm)) {
+            ALOGE("%s: %s", __func__, pcm_get_error(pcm_device->pcm));
+            pcm_device->pcm = NULL;
+            ret = -EIO;
+            goto error_open;
+        }
+        /*
+        * If the stream rate differs from the PCM rate, we need to
+        * create a resampler.
+        */
+        if (out->sample_rate != pcm_device->pcm_profile->config.rate) {
+            ALOGV("%s: create_resampler(), pcm_device_card(%d), pcm_device_id(%d), \
+                    out_rate(%d), device_rate(%d)",__func__,
+                    pcm_device->pcm_profile->card, pcm_device->pcm_profile->id,
+                    out->sample_rate, pcm_device->pcm_profile->config.rate);
+            ret = create_resampler(out->sample_rate,
+                    pcm_device->pcm_profile->config.rate,
+                    audio_channel_count_from_out_mask(out->channel_mask),
+                    RESAMPLER_QUALITY_DEFAULT,
+                    NULL,
+                    &pcm_device->resampler);
+            pcm_device->res_byte_count = 0;
+            pcm_device->res_buffer = NULL;
+        }
+    }
+    return ret;
+
+error_open:
+    out_close_pcm_devices(out);
+    return ret;
+}
+
+static int disable_output_path_l(struct stream_out *out)
+{
+    struct audio_device *adev = out->dev;
+    struct audio_usecase *uc_info;
+
+    uc_info = get_usecase_from_id(adev, out->usecase);
+    if (uc_info == NULL) {
+        ALOGE("%s: Could not find the usecase (%d) in the list",
+             __func__, out->usecase);
+        return -EINVAL;
+    }
+    disable_snd_device(adev, uc_info, uc_info->out_snd_device, true);
+    uc_release_pcm_devices(uc_info);
+    list_remove(&uc_info->adev_list_node);
+    free(uc_info);
+
+    return 0;
+}
+
+static void enable_output_path_l(struct stream_out *out)
+{
+    struct audio_device *adev = out->dev;
+    struct audio_usecase *uc_info;
+
+    uc_info = (struct audio_usecase *)calloc(1, sizeof(struct audio_usecase));
+    uc_info->id = out->usecase;
+    uc_info->type = PCM_PLAYBACK;
+    uc_info->stream = (struct audio_stream *)out;
+    uc_info->devices = out->devices;
+    uc_info->in_snd_device = SND_DEVICE_NONE;
+    uc_info->out_snd_device = SND_DEVICE_NONE;
+    uc_select_pcm_devices(uc_info);
+
+    list_add_tail(&adev->usecase_list, &uc_info->adev_list_node);
+    select_devices(adev, out->usecase);
+}
+
+static int stop_output_stream(struct stream_out *out)
+{
+    int ret = 0;
+    struct audio_device *adev = out->dev;
+    bool do_disable = true;
+
+    ALOGV("%s: enter: usecase(%d: %s)", __func__,
+          out->usecase, use_case_table[out->usecase]);
+
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD &&
+            adev->offload_fx_stop_output != NULL) {
+        adev->offload_fx_stop_output(out->handle);
+
+        if (out->offload_state == OFFLOAD_STATE_PAUSED ||
+                out->offload_state == OFFLOAD_STATE_PAUSED_FLUSHED)
+            do_disable = false;
+        out->offload_state = OFFLOAD_STATE_IDLE;
+    }
+    if (do_disable)
+        ret = disable_output_path_l(out);
+
+    ALOGV("%s: exit: status(%d)", __func__, ret);
+    return ret;
+}
+
+static int start_output_stream(struct stream_out *out)
+{
+    int ret = 0;
+    struct audio_device *adev = out->dev;
+
+    ALOGV("%s: enter: usecase(%d: %s) devices(%#x) channels(%d)",
+          __func__, out->usecase, use_case_table[out->usecase], out->devices, out->config.channels);
+
+    enable_output_path_l(out);
+
+    if (out->usecase != USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        out->compr = NULL;
+        ret = out_open_pcm_devices(out);
+        if (ret != 0)
+            goto error_open;
+#ifdef PREPROCESSING_ENABLED
+        out->echo_reference = NULL;
+        out->echo_reference_generation = adev->echo_reference_generation;
+        if (adev->echo_reference != NULL)
+            out->echo_reference = adev->echo_reference;
+#endif
+    } else {
+        out->compr = compress_open(COMPRESS_CARD, COMPRESS_DEVICE,
+                                   COMPRESS_IN, &out->compr_config);
+        if (out->compr && !is_compress_ready(out->compr)) {
+            ALOGE("%s: %s", __func__, compress_get_error(out->compr));
+            compress_close(out->compr);
+            out->compr = NULL;
+            ret = -EIO;
+            goto error_open;
+        }
+        if (out->offload_callback)
+            compress_nonblock(out->compr, out->non_blocking);
+
+        if (adev->offload_fx_start_output != NULL)
+            adev->offload_fx_start_output(out->handle);
+    }
+    ALOGV("%s: exit", __func__);
+    return 0;
+error_open:
+    stop_output_stream(out);
+error_config:
+    return ret;
+}
+
+static int stop_voice_call(struct audio_device *adev)
+{
+    struct audio_usecase *uc_info;
+
+    ALOGV("%s: enter", __func__);
+    adev->in_call = false;
+
+    /* TODO: implement voice call stop */
+
+    uc_info = get_usecase_from_id(adev, USECASE_VOICE_CALL);
+    if (uc_info == NULL) {
+        ALOGE("%s: Could not find the usecase (%d) in the list",
+              __func__, USECASE_VOICE_CALL);
+        return -EINVAL;
+    }
+
+    disable_snd_device(adev, uc_info, uc_info->out_snd_device, false);
+    disable_snd_device(adev, uc_info, uc_info->in_snd_device, true);
+
+    uc_release_pcm_devices(uc_info);
+    list_remove(&uc_info->adev_list_node);
+    free(uc_info);
+
+    ALOGV("%s: exit", __func__);
+    return 0;
+}
+
+/* always called with adev lock held */
+static int start_voice_call(struct audio_device *adev)
+{
+    struct audio_usecase *uc_info;
+
+    ALOGV("%s: enter", __func__);
+
+    uc_info = (struct audio_usecase *)calloc(1, sizeof(struct audio_usecase));
+    uc_info->id = USECASE_VOICE_CALL;
+    uc_info->type = VOICE_CALL;
+    uc_info->stream = (struct audio_stream *)adev->primary_output;
+    uc_info->devices = adev->primary_output->devices;
+    uc_info->in_snd_device = SND_DEVICE_NONE;
+    uc_info->out_snd_device = SND_DEVICE_NONE;
+
+    uc_select_pcm_devices(uc_info);
+
+    list_add_tail(&adev->usecase_list, &uc_info->adev_list_node);
+
+    select_devices(adev, USECASE_VOICE_CALL);
+
+
+    /* TODO: implement voice call start */
+
+    /* set cached volume */
+    set_voice_volume_l(adev, adev->voice_volume);
+
+    adev->in_call = true;
+    ALOGV("%s: exit", __func__);
+    return 0;
+}
+
+static int check_input_parameters(uint32_t sample_rate,
+                                  audio_format_t format,
+                                  int channel_count)
+{
+    if (format != AUDIO_FORMAT_PCM_16_BIT) return -EINVAL;
+
+    if ((channel_count < 1) || (channel_count > 2)) return -EINVAL;
+
+    switch (sample_rate) {
+    case 8000:
+    case 11025:
+    case 12000:
+    case 16000:
+    case 22050:
+    case 24000:
+    case 32000:
+    case 44100:
+    case 48000:
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
+static size_t get_input_buffer_size(uint32_t sample_rate,
+                                    audio_format_t format,
+                                    int channel_count,
+                                    usecase_type_t usecase_type,
+                                    audio_devices_t devices)
+{
+    size_t size = 0;
+    struct pcm_device_profile *pcm_profile;
+
+    if (check_input_parameters(sample_rate, format, channel_count) != 0)
+        return 0;
+
+    pcm_profile = get_pcm_device(usecase_type, devices);
+    if (pcm_profile == NULL)
+        return 0;
+
+    /*
+     * take resampling into account and return the closest majoring
+     * multiple of 16 frames, as audioflinger expects audio buffers to
+     * be a multiple of 16 frames
+     */
+    size = (pcm_profile->config.period_size * sample_rate) / pcm_profile->config.rate;
+    size = ((size + 15) / 16) * 16;
+
+    return (size * channel_count * audio_bytes_per_sample(format));
+
+}
 
 static uint32_t out_get_sample_rate(const struct audio_stream *stream)
 {
-    struct stream_out_common *out = (struct stream_out_common *)stream;
-    uint32_t rate;
+    struct stream_out *out = (struct stream_out *)stream;
 
-    if (out->sample_rate != 0) {
-        rate = out->sample_rate;
-    } else {
-        rate = out->hw->rate;
-    }
-
-    ALOGV("out_get_sample_rate=%u", rate);
-    return rate;
+    return out->sample_rate;
 }
 
 static int out_set_sample_rate(struct audio_stream *stream, uint32_t rate)
@@ -384,30 +2604,27 @@ static int out_set_sample_rate(struct audio_stream *stream, uint32_t rate)
 
 static size_t out_get_buffer_size(const struct audio_stream *stream)
 {
-    struct stream_out_common *out = (struct stream_out_common *)stream;
-    ALOGV("out_get_buffer_size(%p): %u", stream, out->buffer_size );
-    return out->buffer_size;
-}
+    struct stream_out *out = (struct stream_out *)stream;
 
-static audio_channel_mask_t out_get_channels(const struct audio_stream *stream)
-{
-    struct stream_out_common *out = (struct stream_out_common *)stream;
-    audio_channel_mask_t mask;
-
-    if (out->channel_mask != 0) {
-        mask = out->channel_mask;
-    } else {
-        mask = OUT_CHANNEL_MASK_DEFAULT;
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        return out->compr_config.fragment_size;
     }
 
-    ALOGV("out_get_channels=%x", mask);
-    return mask;
+    return out->config.period_size *
+               audio_stream_out_frame_size((const struct audio_stream_out *)stream);
+}
+
+static uint32_t out_get_channels(const struct audio_stream *stream)
+{
+    struct stream_out *out = (struct stream_out *)stream;
+
+    return out->channel_mask;
 }
 
 static audio_format_t out_get_format(const struct audio_stream *stream)
 {
-    struct stream_out_common *out = (struct stream_out_common *)stream;
-    /*ALOGV("out_get_format(%p): 0x%x", stream, out->format );*/
+    struct stream_out *out = (struct stream_out *)stream;
+
     return out->format;
 }
 
@@ -418,79 +2635,638 @@ static int out_set_format(struct audio_stream *stream, audio_format_t format)
     return -ENOSYS;
 }
 
-static int out_dump(const struct audio_stream *stream, int fd)
+static int do_out_standby_l(struct stream_out *out)
 {
+    struct audio_device *adev = out->dev;
+    int status = 0;
+
+    out->standby = true;
+    if (out->usecase != USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        out_close_pcm_devices(out);
+#ifdef PREPROCESSING_ENABLED
+        /* stop writing to echo reference */
+        if (out->echo_reference != NULL) {
+            out->echo_reference->write(out->echo_reference, NULL);
+            if (out->echo_reference_generation != adev->echo_reference_generation) {
+                ALOGV("%s: release_echo_reference %p", __func__, out->echo_reference);
+                release_echo_reference(out->echo_reference);
+                out->echo_reference_generation = adev->echo_reference_generation;
+            }
+            out->echo_reference = NULL;
+        }
+#endif
+    } else {
+        stop_compressed_output_l(out);
+        out->gapless_mdata.encoder_delay = 0;
+        out->gapless_mdata.encoder_padding = 0;
+        if (out->compr != NULL) {
+            compress_close(out->compr);
+            out->compr = NULL;
+        }
+    }
+    status = stop_output_stream(out);
+
+    return status;
+}
+
+static int out_standby(struct audio_stream *stream)
+{
+    struct stream_out *out = (struct stream_out *)stream;
+    struct audio_device *adev = out->dev;
+
+    ALOGV("%s: enter: usecase(%d: %s)", __func__,
+          out->usecase, use_case_table[out->usecase]);
+    lock_output_stream(out);
+    if (!out->standby) {
+        pthread_mutex_lock(&adev->lock);
+        do_out_standby_l(out);
+        pthread_mutex_unlock(&adev->lock);
+    }
+    pthread_mutex_unlock(&out->lock);
+    ALOGV("%s: exit", __func__);
     return 0;
 }
+
+static int out_dump(const struct audio_stream *stream, int fd)
+{
+    (void)stream;
+    (void)fd;
+
+    return 0;
+}
+
+static int parse_compress_metadata(struct stream_out *out, struct str_parms *parms)
+{
+    int ret = 0;
+    char value[32];
+    struct compr_gapless_mdata tmp_mdata;
+
+    if (!out || !parms) {
+        return -EINVAL;
+    }
+
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_DELAY_SAMPLES, value, sizeof(value));
+    if (ret >= 0) {
+        tmp_mdata.encoder_delay = atoi(value); /* what is a good limit check? */
+    } else {
+        return -EINVAL;
+    }
+
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_PADDING_SAMPLES, value, sizeof(value));
+    if (ret >= 0) {
+        tmp_mdata.encoder_padding = atoi(value);
+    } else {
+        return -EINVAL;
+    }
+
+    out->gapless_mdata = tmp_mdata;
+    out->send_new_metadata = 1;
+    ALOGV("%s new encoder delay %u and padding %u", __func__,
+          out->gapless_mdata.encoder_delay, out->gapless_mdata.encoder_padding);
+
+    return 0;
+}
+
 
 static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
 {
-    ALOGV("+out_set_parameters(%p) '%s'", stream, kvpairs);
-
-    struct stream_out_common *out = (struct stream_out_common *)stream;
+    struct stream_out *out = (struct stream_out *)stream;
     struct audio_device *adev = out->dev;
-    uint32_t v;
-    int ret;
+    struct audio_usecase *usecase;
+    struct listnode *node;
+    struct str_parms *parms;
+    char value[32];
+    int ret, val = 0;
+    struct audio_usecase *uc_info;
+    bool do_standby = false;
+    struct pcm_device *pcm_device;
+    struct pcm_device_profile *pcm_profile;
+#ifdef PREPROCESSING_ENABLED
+    struct stream_in *in = NULL;    /* if non-NULL, then force input to standby */
+#endif
 
-    ret = common_get_routing_param(&v, kvpairs);
-
-    pthread_mutex_lock(&adev->lock);
-
+    ALOGV("%s: enter: usecase(%d: %s) kvpairs: %s out->devices(%d) adev->mode(%d)",
+          __func__, out->usecase, use_case_table[out->usecase], kvpairs, out->devices, adev->mode);
+    parms = str_parms_create_str(kvpairs);
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING, value, sizeof(value));
     if (ret >= 0) {
-        apply_route(out->hw, v);
+        val = atoi(value);
+        pthread_mutex_lock(&adev->lock_inputs);
+        lock_output_stream(out);
+        pthread_mutex_lock(&adev->lock);
+#ifdef PREPROCESSING_ENABLED
+        if (((int)out->devices != val) && (val != 0) && (!out->standby) &&
+            (out->usecase == USECASE_AUDIO_PLAYBACK)) {
+            /* reset active input:
+             *  - to attach the echo reference
+             *  - because a change in output device may change mic settings */
+            if (adev->active_input && (adev->active_input->source == AUDIO_SOURCE_VOICE_COMMUNICATION ||
+                    adev->active_input->source == AUDIO_SOURCE_MIC)) {
+                in = adev->active_input;
+            }
+        }
+#endif
+        if (val != 0) {
+            out->devices = val;
+
+            if (!out->standby) {
+                uc_info = get_usecase_from_id(adev, out->usecase);
+                if (uc_info == NULL) {
+                    ALOGE("%s: Could not find the usecase (%d) in the list",
+                          __func__, out->usecase);
+                } else {
+                    list_for_each(node, &out->pcm_dev_list) {
+                        pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
+                        if ((pcm_device->pcm_profile->devices & val) == 0)
+                            do_standby = true;
+                        val &= ~pcm_device->pcm_profile->devices;
+                    }
+                    if (val != 0)
+                        do_standby = true;
+                }
+                if (do_standby)
+                    do_out_standby_l(out);
+                else {
+                    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+                        uc_info = get_usecase_from_id(adev, USECASE_AUDIO_PLAYBACK);
+                        if (uc_info == NULL) {
+                           ALOGE("%s: Could not find the usecase (%d) in the list",
+                                  __func__, USECASE_AUDIO_PLAYBACK);
+                        }
+                        if (uc_info != NULL && uc_info->out_snd_device == SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES) {
+                           ALOGV("Out_set_param: spk+headset enabled\n");
+                           disable_snd_device(adev, uc_info, SND_DEVICE_OUT_SPEAKER, true);
+                           uc_info->out_snd_device = SND_DEVICE_OUT_HEADPHONES;
+                        }
+                    }
+                    select_devices(adev, out->usecase);
+                }
+            }
+
+            if ((adev->mode == AUDIO_MODE_IN_CALL) && !adev->in_call &&
+                    (out == adev->primary_output)) {
+                start_voice_call(adev);
+            } else if ((adev->mode == AUDIO_MODE_IN_CALL) && adev->in_call &&
+                       (out == adev->primary_output)) {
+                select_devices(adev, USECASE_VOICE_CALL);
+            }
+        }
+
+        if ((adev->mode == AUDIO_MODE_NORMAL) && adev->in_call &&
+                (out == adev->primary_output)) {
+            stop_voice_call(adev);
+        }
+        pthread_mutex_unlock(&adev->lock);
+        pthread_mutex_unlock(&out->lock);
+#ifdef PREPROCESSING_ENABLED
+        if (in) {
+            /* The lock on adev->lock_inputs prevents input stream from being closed */
+            lock_input_stream(in);
+            pthread_mutex_lock(&adev->lock);
+            LOG_ALWAYS_FATAL_IF(in != adev->active_input);
+            do_in_standby_l(in);
+            pthread_mutex_unlock(&adev->lock);
+            pthread_mutex_unlock(&in->lock);
+        }
+#endif
+        pthread_mutex_unlock(&adev->lock_inputs);
     }
 
-    stream_invoke_usecases(out->hw, kvpairs);
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        parse_compress_metadata(out, parms);
+    }
 
-    pthread_mutex_unlock(&adev->lock);
+    str_parms_destroy(parms);
 
-    ALOGV("-out_set_parameters(%p)", out);
-
-    /* Its meaningless to return an error here - it's not an error if
-     * we were sent a parameter we aren't interested in
-     */
-    return 0;
+    if (ret > 0)
+        ret = 0;
+    ALOGV("%s: exit: code(%d)", __func__, ret);
+    return ret;
 }
 
-static char * out_get_parameters(const struct audio_stream *stream, const char *keys)
+static char* out_get_parameters(const struct audio_stream *stream, const char *keys)
 {
-    return strdup("");
+    struct stream_out *out = (struct stream_out *)stream;
+    struct str_parms *query = str_parms_create_str(keys);
+    char *str;
+    char value[256];
+    struct str_parms *reply = str_parms_create();
+    size_t i, j;
+    int ret;
+    bool first = true;
+    ALOGV("%s: enter: keys - %s", __func__, keys);
+    ret = str_parms_get_str(query, AUDIO_PARAMETER_STREAM_SUP_CHANNELS, value, sizeof(value));
+    if (ret >= 0) {
+        value[0] = '\0';
+        i = 0;
+        while (out->supported_channel_masks[i] != 0) {
+            for (j = 0; j < ARRAY_SIZE(out_channels_name_to_enum_table); j++) {
+                if (out_channels_name_to_enum_table[j].value == out->supported_channel_masks[i]) {
+                    if (!first) {
+                        strcat(value, "|");
+                    }
+                    strcat(value, out_channels_name_to_enum_table[j].name);
+                    first = false;
+                    break;
+                }
+            }
+            i++;
+        }
+        str_parms_add_str(reply, AUDIO_PARAMETER_STREAM_SUP_CHANNELS, value);
+        str = str_parms_to_str(reply);
+    } else {
+        str = strdup(keys);
+    }
+    str_parms_destroy(query);
+    str_parms_destroy(reply);
+    ALOGV("%s: exit: returns - %s", __func__, str);
+    return str;
 }
 
 static uint32_t out_get_latency(const struct audio_stream_out *stream)
 {
-    struct stream_out_common *out = (struct stream_out_common *)stream;
+    struct stream_out *out = (struct stream_out *)stream;
 
-    return out->latency;
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD)
+        return COMPRESS_OFFLOAD_PLAYBACK_LATENCY;
+
+    return (out->config.period_count * out->config.period_size * 1000) /
+           (out->config.rate);
 }
 
-static int volume_to_percent(float volume)
+static int out_set_volume(struct audio_stream_out *stream, float left,
+                          float right)
 {
-    float decibels;
-    float percent;
+    struct stream_out *out = (struct stream_out *)stream;
+    struct audio_device *adev = out->dev;
+    int offload_volume[2];//For stereo
 
-    /* Converting back to a decibel scale */
-    if(volume > 0) {
-        decibels = log(volume) / 0.115129f;
-    } else {
-        /* Use the maximum attenuation value 58 */
-        decibels = -58;
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_MULTI_CH) {
+        /* only take left channel into account: the API is for stereo anyway */
+        out->muted = (left == 0.0f);
+        return 0;
+    } else if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        struct mixer_ctl *ctl;
+        struct mixer *mixer = NULL;
+
+        offload_volume[0] = (int)(left * COMPRESS_PLAYBACK_VOLUME_MAX);
+        offload_volume[1] = (int)(right * COMPRESS_PLAYBACK_VOLUME_MAX);
+
+        mixer = mixer_open(MIXER_CARD);
+        if (!mixer) {
+            ALOGE("%s unable to open the mixer for card %d, aborting.",
+                    __func__, MIXER_CARD);
+            return -EINVAL;
+        }
+        ctl = mixer_get_ctl_by_name(mixer, MIXER_CTL_COMPRESS_PLAYBACK_VOLUME);
+        if (!ctl) {
+            ALOGE("%s: Could not get ctl for mixer cmd - %s",
+                  __func__, MIXER_CTL_COMPRESS_PLAYBACK_VOLUME);
+            mixer_close(mixer);
+            return -EINVAL;
+        }
+        ALOGV("out_set_volume set offload volume (%f, %f)", left, right);
+        mixer_ctl_set_array(ctl, offload_volume,
+                            sizeof(offload_volume)/sizeof(offload_volume[0]));
+        mixer_close(mixer);
+        return 0;
     }
 
-    /* decibels range is -58..0, rescale to range 0..100 */
-    percent = ((decibels + 58.0) * (100.0/58.0));
-    return (int)percent;
+    return -ENOSYS;
 }
 
-static int out_set_volume(struct audio_stream_out *stream, float left, float right)
+static void *tfa9895_config_thread(void *context)
 {
-    struct stream_out_common *out = (struct stream_out_common *)stream;
-    int l_pc = volume_to_percent(left);
-    int r_pc = volume_to_percent(right);
+    ALOGV("%s: enter", __func__);
+    pthread_detach(pthread_self());
+    struct audio_device *adev = (struct audio_device *)context;
+    pthread_mutex_lock(&adev->tfa9895_lock);
+    adev->tfa9895_init =
+        adev->htc_acoustic_set_amp_mode(adev->mode, AUDIO_DEVICE_OUT_SPEAKER, 0, 0, false);
+    if (!adev->tfa9895_init) {
+        ALOGE("set_amp_mode failed, need to re-config again");
+        adev->tfa9895_mode_change |= 0x1;
+    }
+    ALOGI("@@##tfa9895_config_thread Done!! tfa9895_mode_change=%d", adev->tfa9895_mode_change);
+    pthread_mutex_unlock(&adev->tfa9895_lock);
+    dummybuf_thread_close(adev);
+    return NULL;
+}
 
-    ALOGV("out_set_volume (%f,%f) -> (%d%%,%d%%)", left, right, l_pc, r_pc);
+static int fast_set_affinity(pid_t tid) {
+    cpu_set_t cpu_set;
+    int cpu_num;
+    const char *irq_procfs = "/proc/asound/irq_affinity";
+    FILE *fp;
 
-    return set_hw_volume(out->hw, l_pc, r_pc);
+    if ((fp = fopen(irq_procfs, "r")) == NULL) {
+        ALOGW("Procfs node %s not found", irq_procfs);
+        return -1;
+    }
+
+    if (fscanf(fp, "%d", &cpu_num) != 1) {
+        ALOGW("Couldn't read CPU id from procfs node %s", irq_procfs);
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+
+    CPU_ZERO(&cpu_set);
+    CPU_SET(cpu_num, &cpu_set);
+    return sched_setaffinity(tid, sizeof(cpu_set), &cpu_set);
+}
+
+static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
+                         size_t bytes)
+{
+    struct stream_out *out = (struct stream_out *)stream;
+    struct audio_device *adev = out->dev;
+    ssize_t ret = 0;
+    struct pcm_device *pcm_device;
+    struct listnode *node;
+    size_t frame_size = audio_stream_out_frame_size(stream);
+    size_t frames_wr = 0, frames_rq = 0;
+    unsigned char *data = NULL;
+    struct pcm_config config;
+#ifdef PREPROCESSING_ENABLED
+    size_t in_frames = bytes / frame_size;
+    size_t out_frames = in_frames;
+    struct stream_in *in = NULL;
+#endif
+    pid_t tid;
+    int err;
+
+    lock_output_stream(out);
+
+    if (out->usecase == USECASE_AUDIO_PLAYBACK && !out->is_fastmixer_affinity_set) {
+        tid = gettid();
+        err = fast_set_affinity(tid);
+        if (err < 0) {
+            ALOGW("Couldn't set affinity for tid %d; error %d", tid, err);
+        }
+        out->is_fastmixer_affinity_set = true;
+    }
+
+    if (out->standby) {
+#ifdef PREPROCESSING_ENABLED
+        pthread_mutex_unlock(&out->lock);
+        /* Prevent input stream from being closed */
+        pthread_mutex_lock(&adev->lock_inputs);
+        lock_output_stream(out);
+        if (!out->standby) {
+            pthread_mutex_unlock(&adev->lock_inputs);
+            goto false_alarm;
+        }
+#endif
+        pthread_mutex_lock(&adev->lock);
+        ret = start_output_stream(out);
+        /* ToDo: If use case is compress offload should return 0 */
+        if (ret != 0) {
+            pthread_mutex_unlock(&adev->lock);
+#ifdef PREPROCESSING_ENABLED
+            pthread_mutex_unlock(&adev->lock_inputs);
+#endif
+            goto exit;
+        }
+        out->standby = false;
+
+#ifdef PREPROCESSING_ENABLED
+        /* A change in output device may change the microphone selection */
+        if (adev->active_input &&
+            (adev->active_input->source == AUDIO_SOURCE_VOICE_COMMUNICATION ||
+                adev->active_input->source == AUDIO_SOURCE_MIC)) {
+                    in = adev->active_input;
+                    ALOGV("%s: enter:) force_input_standby true", __func__);
+        }
+#endif
+        pthread_mutex_unlock(&adev->lock);
+#ifdef PREPROCESSING_ENABLED
+        if (!in) {
+            /* Leave mutex locked iff in != NULL */
+            pthread_mutex_unlock(&adev->lock_inputs);
+        }
+#endif
+    }
+false_alarm:
+
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        ALOGVV("%s: writing buffer (%d bytes) to compress device", __func__, bytes);
+
+        if (out->offload_state == OFFLOAD_STATE_PAUSED_FLUSHED) {
+            ALOGV("start offload write from pause state");
+            pthread_mutex_lock(&adev->lock);
+            enable_output_path_l(out);
+            pthread_mutex_unlock(&adev->lock);
+        }
+
+        if (out->send_new_metadata) {
+            ALOGVV("send new gapless metadata");
+            compress_set_gapless_metadata(out->compr, &out->gapless_mdata);
+            out->send_new_metadata = 0;
+        }
+
+        ret = compress_write(out->compr, buffer, bytes);
+        ALOGVV("%s: writing buffer (%d bytes) to compress device returned %d", __func__, bytes, ret);
+        if (ret >= 0 && ret < (ssize_t)bytes) {
+            send_offload_cmd_l(out, OFFLOAD_CMD_WAIT_FOR_BUFFER);
+        }
+        if (out->offload_state != OFFLOAD_STATE_PLAYING) {
+            compress_start(out->compr);
+            out->offload_state = OFFLOAD_STATE_PLAYING;
+        }
+        pthread_mutex_unlock(&out->lock);
+#ifdef PREPROCESSING_ENABLED
+        if (in) {
+            /* This mutex was left locked iff in != NULL */
+            pthread_mutex_unlock(&adev->lock_inputs);
+        }
+#endif
+        return ret;
+    } else {
+#ifdef PREPROCESSING_ENABLED
+        if (android_atomic_acquire_load(&adev->echo_reference_generation)
+                != out->echo_reference_generation) {
+            pthread_mutex_lock(&adev->lock);
+            if (out->echo_reference != NULL) {
+                ALOGV("%s: release_echo_reference %p", __func__, out->echo_reference);
+                release_echo_reference(out->echo_reference);
+            }
+            // note that adev->echo_reference_generation here can be different from the one
+            // tested above but it doesn't matter as we now have the adev mutex and it is consistent
+            // with what has been set by get_echo_reference() or put_echo_reference()
+            out->echo_reference_generation = adev->echo_reference_generation;
+            out->echo_reference = adev->echo_reference;
+            ALOGV("%s: update echo reference generation %d", __func__,
+                  out->echo_reference_generation);
+            pthread_mutex_unlock(&adev->lock);
+        }
+#endif
+
+        if (out->muted)
+            memset((void *)buffer, 0, bytes);
+        list_for_each(node, &out->pcm_dev_list) {
+            pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
+            if (pcm_device->resampler) {
+                if (bytes * pcm_device->pcm_profile->config.rate / out->sample_rate + frame_size
+                        > pcm_device->res_byte_count) {
+                    pcm_device->res_byte_count =
+                        bytes * pcm_device->pcm_profile->config.rate / out->sample_rate + frame_size;
+                    pcm_device->res_buffer =
+                        realloc(pcm_device->res_buffer, pcm_device->res_byte_count);
+                    ALOGV("%s: resampler res_byte_count = %zu", __func__,
+                        pcm_device->res_byte_count);
+                }
+                frames_rq = bytes / frame_size;
+                frames_wr = pcm_device->res_byte_count / frame_size;
+                ALOGVV("%s: resampler request frames = %d frame_size = %d",
+                    __func__, frames_rq, frame_size);
+                pcm_device->resampler->resample_from_input(pcm_device->resampler,
+                    (int16_t *)buffer, &frames_rq, (int16_t *)pcm_device->res_buffer, &frames_wr);
+                ALOGVV("%s: resampler output frames_= %d", __func__, frames_wr);
+            }
+            if (pcm_device->pcm) {
+#ifdef PREPROCESSING_ENABLED
+                if (out->echo_reference != NULL && pcm_device->pcm_profile->devices != SND_DEVICE_OUT_SPEAKER) {
+                    struct echo_reference_buffer b;
+                    b.raw = (void *)buffer;
+                    b.frame_count = in_frames;
+
+                    get_playback_delay(out, out_frames, &b);
+                    out->echo_reference->write(out->echo_reference, &b);
+                 }
+#endif
+                if (adev->tfa9895_mode_change == 0x1) {
+                    if (out->devices & AUDIO_DEVICE_OUT_SPEAKER) {
+                        pthread_mutex_lock(&adev->tfa9895_lock);
+                        data = (unsigned char *)
+                                calloc(pcm_frames_to_bytes(pcm_device->pcm, out->config.period_size),
+                                        sizeof(unsigned char));
+                        if (data) {
+                            int i;
+
+                            // reopen pcm with stop_threshold = INT_MAX/2
+                            memcpy(&config, &pcm_device->pcm_profile->config,
+                                    sizeof(struct pcm_config));
+                            config.stop_threshold = INT_MAX/2;
+
+                            if (pcm_device->pcm)
+                                pcm_close(pcm_device->pcm);
+
+                            for (i = 0; i < RETRY_NUMBER; i++) {
+                                pcm_device->pcm = pcm_open(pcm_device->pcm_profile->card,
+                                        pcm_device->pcm_profile->id,
+                                        PCM_OUT | PCM_MONOTONIC, &config);
+                                if (pcm_device->pcm != NULL && pcm_is_ready(pcm_device->pcm))
+                                    break;
+                                else
+                                    usleep(10000);
+                            }
+                            if (i >= RETRY_NUMBER)
+                                ALOGE("%s: failed to reopen pcm device", __func__);
+
+                            if (pcm_device->pcm) {
+                                for (i = out->config.period_count; i > 0; i--)
+                                    pcm_write(pcm_device->pcm, (void *)data,
+                                           pcm_frames_to_bytes(pcm_device->pcm,
+                                           out->config.period_size));
+                                /* TODO: Hold on 100 ms and wait i2s signal ready
+                                     before giving dsp related i2c commands */
+                                usleep(100000);
+                                adev->tfa9895_mode_change &= ~0x1;
+                                ALOGV("@@##checking - 2: tfa9895_config_thread: "
+                                    "adev->tfa9895_mode_change=%d", adev->tfa9895_mode_change);
+                                adev->tfa9895_init =
+                                        adev->htc_acoustic_set_amp_mode(
+                                                adev->mode, AUDIO_DEVICE_OUT_SPEAKER, 0, 0, false);
+                            }
+                            free(data);
+
+                            // reopen pcm with normal stop_threshold
+                            if (pcm_device->pcm)
+                                pcm_close(pcm_device->pcm);
+
+                            for (i = 0; i < RETRY_NUMBER; i++) {
+                                pcm_device->pcm = pcm_open(pcm_device->pcm_profile->card,
+                                        pcm_device->pcm_profile->id,
+                                        PCM_OUT | PCM_MONOTONIC, &pcm_device->pcm_profile->config);
+                                if (pcm_device->pcm != NULL && pcm_is_ready(pcm_device->pcm))
+                                    break;
+                                else
+                                    usleep(10000);
+                            }
+                            if (i >= RETRY_NUMBER) {
+                                ALOGE("%s: failed to reopen pcm device, error return", __func__);
+                                pthread_mutex_unlock(&adev->tfa9895_lock);
+                                pthread_mutex_unlock(&out->lock);
+                                return -1;
+                            }
+                        }
+                    }
+                    pthread_mutex_unlock(&adev->tfa9895_lock);
+                }
+                ALOGVV("%s: writing buffer (%d bytes) to pcm device", __func__, bytes);
+                if (pcm_device->resampler && pcm_device->res_buffer)
+                    pcm_device->status =
+                        pcm_write(pcm_device->pcm, (void *)pcm_device->res_buffer,
+                            frames_wr * frame_size);
+                else
+                    pcm_device->status = pcm_write(pcm_device->pcm, (void *)buffer, bytes);
+                if (pcm_device->status != 0)
+                    ret = pcm_device->status;
+            }
+        }
+        if (ret == 0)
+            out->written += bytes / (out->config.channels * sizeof(short));
+    }
+
+exit:
+    pthread_mutex_unlock(&out->lock);
+
+    if (ret != 0) {
+        list_for_each(node, &out->pcm_dev_list) {
+            pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
+            if (pcm_device->pcm && pcm_device->status != 0)
+                ALOGE("%s: error %zd - %s", __func__, ret, pcm_get_error(pcm_device->pcm));
+        }
+        out_standby(&out->stream.common);
+        usleep(bytes * 1000000 / audio_stream_out_frame_size(stream) /
+               out_get_sample_rate(&out->stream.common));
+    }
+
+#ifdef PREPROCESSING_ENABLED
+    if (in) {
+        /* The lock on adev->lock_inputs prevents input stream from being closed */
+        lock_input_stream(in);
+        pthread_mutex_lock(&adev->lock);
+        LOG_ALWAYS_FATAL_IF(in != adev->active_input);
+        do_in_standby_l(in);
+        pthread_mutex_unlock(&adev->lock);
+        pthread_mutex_unlock(&in->lock);
+        /* This mutex was left locked iff in != NULL */
+        pthread_mutex_unlock(&adev->lock_inputs);
+    }
+#endif
+
+    return bytes;
+}
+
+static int out_get_render_position(const struct audio_stream_out *stream,
+                                   uint32_t *dsp_frames)
+{
+    struct stream_out *out = (struct stream_out *)stream;
+    *dsp_frames = 0;
+    if ((out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) && (dsp_frames != NULL)) {
+        lock_output_stream(out);
+        if (out->compr != NULL) {
+            compress_get_tstamp(out->compr, (unsigned long *)dsp_frames,
+                    &out->sample_rate);
+            ALOGVV("%s rendered frames %d sample_rate %d",
+                   __func__, *dsp_frames, out->sample_rate);
+        }
+        pthread_mutex_unlock(&out->lock);
+        return 0;
+    } else
+        return -EINVAL;
 }
 
 static int out_add_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
@@ -515,820 +3291,367 @@ static int out_get_next_write_timestamp(const struct audio_stream_out *stream,
     return -EINVAL;
 }
 
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-static int out_set_callback(struct audio_stream_out *stream,
-                                    stream_callback_t callback, void *cookie,
-                                    async_common_fn_t fn)
+static int out_get_presentation_position(const struct audio_stream_out *stream,
+                                   uint64_t *frames, struct timespec *timestamp)
 {
-    struct stream_out_common *out = (struct stream_out_common *)stream;
-    async_common_t *async = &out->async_common;
+    struct stream_out *out = (struct stream_out *)stream;
+    int ret = -1;
+    unsigned long dsp_frames;
 
-    async->exit = false;
-    async->callback = NULL;
+    lock_output_stream(out);
 
-    int rv = pthread_cond_init(&(async->cv), NULL );
-    if (rv != 0) {
-        ALOGE("failed to create async condvar");
-        return rv;
-    }
-
-    rv = pthread_mutex_init(&(async->mutex), NULL);
-    if(rv != 0) {
-        ALOGE("failed to create async mutex");
-        pthread_cond_destroy(&(async->cv));
-        return rv;
-    }
-
-    rv = pthread_create(&(async->thread), NULL, fn, async);
-    if (rv != 0) {
-        ALOGE("failed to create async thread");
-        pthread_mutex_destroy(&(async->mutex));
-        pthread_cond_destroy(&(async->cv));
-        return rv;
-    }
-
-    async->stream = stream;
-    async->callback = callback;
-    async->callback_param = cookie;
-    out->use_async = true;
-    return 0;
-}
-
-static int signal_async_thread(async_common_t *async, enum async_mode mode)
-{
-    int ret = 0;
-
-    pthread_mutex_lock(&(async->mutex));
-    if (async->mode != ASYNC_NONE) {
-        ret = -EBUSY;
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        if (out->compr != NULL) {
+            compress_get_tstamp(out->compr, &dsp_frames,
+                    &out->sample_rate);
+            ALOGVV("%s rendered frames %ld sample_rate %d",
+                   __func__, dsp_frames, out->sample_rate);
+            *frames = dsp_frames;
+            ret = 0;
+            /* this is the best we can do */
+            clock_gettime(CLOCK_MONOTONIC, timestamp);
+        }
     } else {
-        async->mode = mode;
-        pthread_cond_signal(&(async->cv));
+        /* FIXME: which device to read from? */
+        if (!list_empty(&out->pcm_dev_list)) {
+            unsigned int avail;
+            struct pcm_device *pcm_device = node_to_item(list_head(&out->pcm_dev_list),
+                                                   struct pcm_device, stream_list_node);
+
+            if (pcm_get_htimestamp(pcm_device->pcm, &avail, timestamp) == 0) {
+                size_t kernel_buffer_size = out->config.period_size * out->config.period_count;
+                int64_t signed_frames = out->written - kernel_buffer_size + avail;
+                /* This adjustment accounts for buffering after app processor.
+                   It is based on estimated DSP latency per use case, rather than exact. */
+                signed_frames -=
+                    (render_latency(out->usecase) * out->sample_rate / 1000000LL);
+
+                /* It would be unusual for this value to be negative, but check just in case ... */
+                if (signed_frames >= 0) {
+                    *frames = signed_frames;
+                    ret = 0;
+                }
+            }
+        }
     }
-    pthread_mutex_unlock(&(async->mutex));
+
+    pthread_mutex_unlock(&out->lock);
+
     return ret;
 }
-#endif /* TINYHAL_COMPRESS_PLAYBACK */
 
-static void do_close_out_common(struct audio_stream_out *stream)
+static int out_set_callback(struct audio_stream_out *stream,
+            stream_callback_t callback, void *cookie)
 {
-    struct stream_out_common *out = (struct stream_out_common *)stream;
+    struct stream_out *out = (struct stream_out *)stream;
 
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-    /* Signal the async thread to stop and exit */
-    if (out->use_async) {
-        pthread_mutex_lock(&(out->async_common.mutex));
-        out->async_common.exit = true;
-        pthread_cond_signal(&(out->async_common.cv));
-        pthread_mutex_unlock(&(out->async_common.mutex));
-        // Wait for thread to exit
-        pthread_join(out->async_common.thread, NULL);
-    }
-#endif /* TINYHAL_COMPRESS_PLAYBACK */
-
-    release_stream(out->hw);
-    free(stream);
-}
-
-static int do_init_out_common( struct stream_out_common *out,
-                                    const struct audio_config *config,
-                                    audio_devices_t devices )
-{
-    int ret;
-
-    ALOGV("do_init_out_common rate=%u channels=%x",
-                config->sample_rate,
-                config->channel_mask);
-
-    out->standby = true;
-
-    out->stream.common.get_sample_rate = out_get_sample_rate;
-    out->stream.common.set_sample_rate = out_set_sample_rate;
-    out->stream.common.get_buffer_size = out_get_buffer_size;
-    out->stream.common.get_channels = out_get_channels;
-    out->stream.common.get_format = out_get_format;
-    out->stream.common.set_format = out_set_format;
-    out->stream.common.dump = out_dump;
-    out->stream.common.set_parameters = out_set_parameters;
-    out->stream.common.get_parameters = out_get_parameters;
-    out->stream.common.add_audio_effect = out_add_audio_effect;
-    out->stream.common.remove_audio_effect = out_remove_audio_effect;
-    out->stream.get_latency = out_get_latency;
-    out->stream.set_volume = out_set_volume;
-    out->stream.get_next_write_timestamp = out_get_next_write_timestamp;
-
-    /* init requested stream config */
-    out->format = config->format;
-    out->sample_rate = config->sample_rate;
-    out->channel_mask = config->channel_mask;
-    out->channel_count = popcount(out->channel_mask);
-
-    /* Default settings */
-#ifdef AUDIO_DEVICE_API_VERSION_3_0
-    out->frame_size = audio_stream_out_frame_size(&out->stream);
-#else
-    out->frame_size = audio_stream_frame_size(&out->stream.common);
-#endif
-    /* Apply initial route */
-    apply_route(out->hw, devices);
-
+    ALOGV("%s", __func__);
+    lock_output_stream(out);
+    out->offload_callback = callback;
+    out->offload_cookie = cookie;
+    pthread_mutex_unlock(&out->lock);
     return 0;
 }
 
-/*********************************************************************
- * PCM output stream
- *********************************************************************/
-
-static unsigned int out_pcm_cfg_period_count(struct stream_out_pcm *out)
+static int out_pause(struct audio_stream_out* stream)
 {
-    if (out->common.hw->period_count != 0) {
-        return out->common.hw->period_count;
-    } else {
-        return OUT_PERIOD_COUNT_DEFAULT;
+    struct stream_out *out = (struct stream_out *)stream;
+    int status = -ENOSYS;
+    ALOGV("%s", __func__);
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        lock_output_stream(out);
+        if (out->compr != NULL && out->offload_state == OFFLOAD_STATE_PLAYING) {
+            status = compress_pause(out->compr);
+            out->offload_state = OFFLOAD_STATE_PAUSED;
+            pthread_mutex_lock(&out->dev->lock);
+            status = disable_output_path_l(out);
+            pthread_mutex_unlock(&out->dev->lock);
+        }
+        pthread_mutex_unlock(&out->lock);
     }
+    return status;
 }
 
-static unsigned int out_pcm_cfg_period_size(struct stream_out_pcm *out)
+static int out_resume(struct audio_stream_out* stream)
 {
-    if (out->common.hw->period_size != 0) {
-        return out->common.hw->period_size;
-    } else {
-        return OUT_PERIOD_SIZE_DEFAULT;
+    struct stream_out *out = (struct stream_out *)stream;
+    int status = -ENOSYS;
+    ALOGV("%s", __func__);
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        status = 0;
+        lock_output_stream(out);
+        if (out->compr != NULL && out->offload_state == OFFLOAD_STATE_PAUSED) {
+            pthread_mutex_lock(&out->dev->lock);
+            enable_output_path_l(out);
+            pthread_mutex_unlock(&out->dev->lock);
+            status = compress_resume(out->compr);
+            out->offload_state = OFFLOAD_STATE_PLAYING;
+        }
+        pthread_mutex_unlock(&out->lock);
     }
+    return status;
 }
 
-static unsigned int out_pcm_cfg_rate(struct stream_out_pcm *out)
+static int out_drain(struct audio_stream_out* stream, audio_drain_type_t type )
 {
-    if (out->common.hw->rate != 0) {
-        return out->common.hw->rate;
-    } else {
-        return OUT_RATE_DEFAULT;
+    struct stream_out *out = (struct stream_out *)stream;
+    int status = -ENOSYS;
+    ALOGV("%s", __func__);
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        lock_output_stream(out);
+        if (type == AUDIO_DRAIN_EARLY_NOTIFY)
+            status = send_offload_cmd_l(out, OFFLOAD_CMD_PARTIAL_DRAIN);
+        else
+            status = send_offload_cmd_l(out, OFFLOAD_CMD_DRAIN);
+        pthread_mutex_unlock(&out->lock);
     }
+    return status;
 }
 
-static unsigned int out_pcm_cfg_channel_count(struct stream_out_pcm *out)
+static int out_flush(struct audio_stream_out* stream)
 {
-    if (out->common.channel_count != 0) {
-        return out->common.channel_count;
-    } else {
-        return OUT_CHANNEL_COUNT_DEFAULT;
-    }
-}
-
-/* must be called with hw device and output stream mutexes locked */
-static void do_out_pcm_standby(struct stream_out_pcm *out)
-{
-    struct audio_device *adev = out->common.dev;
-
-    ALOGV("+do_out_standby(%p)", out);
-
-    if (!out->common.standby) {
-        pcm_close(out->pcm);
-        out->pcm = NULL;
-        out->common.standby = true;
-    }
-
-    ALOGV("-do_out_standby(%p)", out);
-}
-
-static void out_pcm_fill_params(struct stream_out_pcm *out,
-                                const struct pcm_config *config )
-{
-    out->hw_sample_rate = config->rate;
-    out->hw_channel_count = config->channels;
-    out->common.buffer_size = pcm_frames_to_bytes(out->pcm, config->period_size);
-
-    out->common.latency = (config->period_size *
-                           config->period_count * 1000) / config->rate;
-}
-
-/* must be called with hw device and output stream mutexes locked */
-static int start_output_pcm(struct stream_out_pcm *out)
-{
-    struct audio_device *adev = out->common.dev;
-    int ret;
-
-    struct pcm_config config = {
-        .channels = out_pcm_cfg_channel_count(out),
-        .rate = out_pcm_cfg_rate(out),
-        .period_size = out_pcm_cfg_period_size(out),
-        .period_count = out_pcm_cfg_period_count(out),
-        .format = PCM_FORMAT_S16_LE,
-        .start_threshold = 0,
-        .stop_threshold = 0,
-        .silence_threshold = 0
-    };
-
-    ALOGV("+start_output_stream(%p)", out);
-
-    out->pcm = pcm_open(out->common.hw->card_number,
-                        out->common.hw->device_number,
-                        PCM_OUT,
-                        &config);
-
-    if (out->pcm && !pcm_is_ready(out->pcm)) {
-        ALOGE("pcm_open(out) failed: %s", pcm_get_error(out->pcm));
-        pcm_close(out->pcm);
-        return -ENOMEM;
-    }
-
-    out_pcm_fill_params( out, &config );
-
-    ALOGV("-start_output_stream(%p)", out);
-    return 0;
-}
-
-static int out_pcm_standby(struct audio_stream *stream)
-{
-    struct stream_out_pcm *out = (struct stream_out_pcm *)stream;
-
-    pthread_mutex_lock(&out->common.lock);
-    do_out_pcm_standby(out);
-    pthread_mutex_unlock(&out->common.lock);
-
-    return 0;
-}
-
-static ssize_t out_pcm_write(struct audio_stream_out *stream, const void* buffer,
-                         size_t bytes)
-{
-    ALOGV("+out_pcm_write(%p) l=%u", stream, bytes);
-
-    int ret = 0;
-    struct stream_out_pcm *out = (struct stream_out_pcm *)stream;
-    struct audio_device *adev = out->common.dev;
-
-    /* Check that we are routed to something. Android can send routing
-     * commands that tell us to disconnect from everything and in that
-     * state we shouldn't issue any write commands because we can't be
-     * sure that the driver will accept a write to nowhere
-     */
-    if (get_current_routes(out->common.hw) == 0) {
-        ALOGV("-out_pcm_write(%p) 0 (no routes)", stream);
+    struct stream_out *out = (struct stream_out *)stream;
+    ALOGV("%s", __func__);
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        lock_output_stream(out);
+        if (out->offload_state == OFFLOAD_STATE_PLAYING) {
+            ALOGE("out_flush() called in wrong state %d", out->offload_state);
+            pthread_mutex_unlock(&out->lock);
+            return -ENOSYS;
+        }
+        if (out->offload_state == OFFLOAD_STATE_PAUSED) {
+            stop_compressed_output_l(out);
+            out->offload_state = OFFLOAD_STATE_PAUSED_FLUSHED;
+        }
+        pthread_mutex_unlock(&out->lock);
         return 0;
     }
-
-    pthread_mutex_lock(&out->common.lock);
-    if (out->common.standby) {
-        ret = start_output_pcm(out);
-        if (ret != 0) {
-            goto exit;
-        }
-        out->common.standby = false;
-    }
-
-    ret = pcm_writei(out->pcm, buffer, pcm_bytes_to_frames(out->pcm, bytes));
-    if (ret >= 0) {
-        ret = bytes;
-    }
-
-exit:
-    pthread_mutex_unlock(&out->common.lock);
-
-    ALOGV("-out_pcm_write(%p) r=%u", stream, ret);
-
-    return ret;
+    return -ENOSYS;
 }
 
-static int out_pcm_get_render_position(const struct audio_stream_out *stream,
-                                   uint32_t *dsp_frames)
-{
-    (void)stream;
-    (void)dsp_frames;
-    return -EINVAL;
-}
-
-static void do_close_out_pcm(struct audio_stream_out *stream)
-{
-    out_pcm_standby(&stream->common);
-    do_close_out_common(stream);
-}
-
-static int do_init_out_pcm( struct stream_out_pcm *out,
-                                    const struct audio_config *config )
-{
-    out->common.close = do_close_out_pcm;
-    out->common.stream.common.standby = out_pcm_standby;
-    out->common.stream.write = out_pcm_write;
-    out->common.stream.get_render_position = out_pcm_get_render_position;
-
-    out->common.buffer_size = out_pcm_cfg_period_size(out) * out->common.frame_size;
-
-    out->common.latency = (out_pcm_cfg_period_size(out) *
-                out_pcm_cfg_period_count(out) * 1000) / out->common.sample_rate;
-
-    return 0;
-}
-
-/********************************************************************
- * Compressed output stream
- ********************************************************************/
-
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-static int do_standby_compress_l(struct stream_out_compress *out)
-{
-    int ret;
-
-    if (out->compress && !out->paused) {
-        ALOGV("out_compress_standby(%p) not paused -closing compress\n", out);
-        if (out->started) {
-            compress_stop(out->compress);
-            out->started = false;
-        }
-        compress_close(out->compress);
-        out->compress = NULL;
-    }
-
-    return 0;
-}
-
-static int out_compress_standby(struct audio_stream *stream)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-    int ret;
-
-    pthread_mutex_lock(&out->common.lock);
-    ret = do_standby_compress_l(out);
-    pthread_mutex_unlock(&out->common.lock);
-    return ret;
-}
-
-static int open_output_compress(struct stream_out_compress *out)
-{
-    struct compr_config config;
-    struct compress *cmpr;
-    int ret = 0;
-
-    pthread_mutex_lock(&out->common.lock);
-
-    if (!out->compress) {
-        config.fragment_size = 0;   /* don't care */
-        config.fragments = 0;
-        config.codec = &out->codec;
-
-        /* tinycompress in & out defines are the reverse of tinyalsa
-           For tinycompress COMPRESS_IN=output, COMPRESS_OUT=input */
-        cmpr = compress_open(out->common.hw->card_number,
-                                      out->common.hw->device_number,
-                                      COMPRESS_IN,
-                                      &config);
-        if (!is_compress_ready(cmpr)) {
-            ALOGE("Failed to open output compress: %s",
-                                        compress_get_error(cmpr));
-            compress_close(cmpr);
-            ret = -EBUSY;
-            goto exit;
-        }
-        compress_set_max_poll_wait(cmpr, MAX_COMPRESS_POLL_WAIT_MS);
-        compress_nonblock(cmpr, out->common.use_async);
-        out->common.buffer_size = config.fragment_size * config.fragments;
-        ALOGV("compressed buffer size=%u", out->common.buffer_size);
-        out->compress = cmpr;
-    }
-
-exit:
-    pthread_mutex_unlock(&out->common.lock);
-
-    return ret;
-}
-
-static int start_output_compress(struct stream_out_compress *out)
-{
-    int ret;
-
-    pthread_mutex_lock(&out->common.lock);
-
-    ret = compress_start(out->compress);
-
-    if (ret < 0) {
-        do_standby_compress_l(out);
-    } else {
-        out->started = true;
-        if(out->refresh_gapless_meta){
-            compress_set_gapless_metadata(out->compress,&out->g_data);
-            out->refresh_gapless_meta = false;
-            out->g_data.encoder_delay = 0;
-            out->g_data.encoder_padding = 0;
-        }
-    }
-
-    pthread_mutex_unlock(&out->common.lock);
-    return ret;
-}
-
-static ssize_t out_compress_write(struct audio_stream_out *stream,
-                            const void* buffer, size_t bytes)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-    int ret = 0;
-
-    ALOGV("out_compress_write(%p) %u", stream, bytes);
-
-    ret = open_output_compress(out);
-
-    if (ret < 0) {
-        ALOGE("out_compress_write(%p): failed to open: %d", stream, ret );
-        return ret;
-    }
-
-    ret = compress_write(out->compress, buffer, bytes);
-
-    if (ret >= 0) {
-        if (!out->started) {
-            if (start_output_compress(out) < 0) {
-                ret = -1;
-                goto start_failed;
-            }
-        }
-
-        if (out->common.use_async) {
-            if ((unsigned)ret < bytes) {
-                /* not all bytes written */
-                signal_async_thread(&out->common.async_common, ASYNC_POLL);
-            }
-        }
-    }
-start_failed:
-    ALOGE_IF(ret < 0,"out_compress_write(%p) failed: %d\n", stream, ret);
-    return ret;
-}
-
-static int out_compress_pause(struct audio_stream_out *stream)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-    int ret = -EBADFD;
-
-    ALOGV("out_compress_pause(%p)", stream);
-
-    /* Avoid race condition with standby */
-    pthread_mutex_lock(&out->common.lock);
-
-    if (!out->paused && out->compress) {
-        out->paused = true;
-        ret = compress_pause(out->compress);
-    }
-    pthread_mutex_unlock(&out->common.lock);
-    return ret;
-}
-
-static int out_compress_resume(struct audio_stream_out *stream)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-    int ret = -EBADFD;
-
-    ALOGV("out_compress_resume(%p)", stream);
-
-    /* Avoid race condition with standby */
-    pthread_mutex_lock(&out->common.lock);
-    if (out->paused && out->compress) {
-        out->paused = false;
-        ret = compress_resume(out->compress);
-    }
-    pthread_mutex_unlock(&out->common.lock);
-    return ret;
-}
-
-static int out_compress_drain(struct audio_stream_out *stream,
-                                    audio_drain_type_t type)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-    int ret = 0;
-
-    ALOGV("out_compress_drain(%p)", stream);
-
-    if (out->common.use_async) {
-        ret = signal_async_thread(&out->common.async_common,
-                (type == AUDIO_DRAIN_EARLY_NOTIFY)
-                    ? ASYNC_EARLY_DRAIN
-                    : ASYNC_FULL_DRAIN);
-    } else {
-        if(type == AUDIO_DRAIN_EARLY_NOTIFY){
-            ret = compress_next_track(out->compress);
-            if(ret != 0)
-                return ret;
-            ret = compress_partial_drain(out->compress);
-        }
-        else
-            ret = compress_drain(out->compress);
-
-        out->started = false;
-    }
-
-    return ret;
-}
-
-static int out_compress_flush(struct audio_stream_out *stream)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-
-    ALOGV("out_compress_flush(%p)", stream);
-
-    pthread_mutex_lock(&out->common.lock);
-    if (out->compress && out->started) {
-        compress_stop(out->compress);
-        out->paused = false;
-        out->started = false;
-    }
-    pthread_mutex_unlock(&out->common.lock);
-    return 0;
-}
-
-static int out_compress_get_render_position(const struct audio_stream_out *stream,
-                                   uint32_t *dsp_frames)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-    long unsigned int samples;
-    unsigned int sampling_rate;
-
-    if (dsp_frames) {
-        *dsp_frames = 0;
-
-        if (!out->started) {
-            ALOGV("out_compress_get_render_position(%p) not started", stream);
-            return 0;
-        }
-
-        pthread_mutex_lock(&out->common.lock);
-
-        if (out->started) {
-            if (compress_get_tstamp(out->compress, &samples, &sampling_rate) == 0) {
-                *dsp_frames = samples;
-                ALOGV("compress(%p) render position=%u", stream, *dsp_frames);
-            }
-        }
-
-        pthread_mutex_unlock(&out->common.lock);
-    }
-
-    return 0;
-}
-
-static void* out_compress_async_fn(void *arg)
-{
-    async_common_t* const pW = (async_common_t*)arg;
-    struct stream_out_compress *out = (struct stream_out_compress *)pW->stream;
-    enum async_mode mode;
-
-    while(!pW->exit) {
-        pthread_mutex_lock(&(pW->mutex));
-        ALOGV( "async fn wait for work");
-        pthread_cond_wait(&(pW->cv), &(pW->mutex));
-
-        if(pW->exit) {
-            break;
-        }
-
-        mode = pW->mode;
-        pW->mode = ASYNC_NONE;
-        pthread_mutex_unlock(&(pW->mutex));
-
-        switch(mode){
-            case ASYNC_POLL:
-                ALOGV("ASYNC_POLL");
-
-                compress_wait(out->compress, MAX_COMPRESS_POLL_WAIT_MS);
-
-                pW->callback( STREAM_CBK_EVENT_WRITE_READY,
-                                NULL,
-                                pW->callback_param );
-                break;
-
-            case ASYNC_EARLY_DRAIN:
-            case ASYNC_FULL_DRAIN:
-                ALOGV("ASYNC_%s_DRAIN",
-                            (mode == ASYNC_EARLY_DRAIN) ? "EARLY" : "FULL");
-
-                if(mode == ASYNC_EARLY_DRAIN){
-                    compress_next_track(out->compress);
-                    compress_partial_drain(out->compress);
-                }
-                else
-                    compress_drain(out->compress);
-
-                out->started = false;
-
-                pW->callback( STREAM_CBK_EVENT_DRAIN_READY,
-                                NULL,
-                                pW->callback_param );
-                break;
-
-            default:
-                break;
-        }
-
-    }
-
-    return NULL;
-}
-
-static int out_compress_set_callback(struct audio_stream_out *stream,
-                                    stream_callback_t callback, void *cookie)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-    int ret = out_set_callback(stream, callback, cookie, out_compress_async_fn);
-    return ret;
-}
-
-static void out_compress_close(struct audio_stream_out *stream)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-
-    ALOGV("out_compress_close(%p)", stream);
-
-    out->paused = false;
-    out_compress_standby(&stream->common);
-
-    do_close_out_common(stream);
-}
-
-static int out_compress_set_parameters(struct audio_stream *stream, const char *kv_pairs)
-{
-    struct stream_out_compress *out = (struct stream_out_compress *)stream;
-    struct str_parms *parms;
-    char value[32];
-    int ret;
-    bool need_refresh_gapless = false;
-
-    ALOGV("+out_compress_set_parameters(%p) '%s' ", stream, kv_pairs);
-    parms = str_parms_create_str(kv_pairs);
-    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_DELAY_SAMPLES,
-                            value, sizeof(value));
-    if(ret >= 0){
-        out->g_data.encoder_delay= atoi(value);
-        need_refresh_gapless = true;
-    }
-
-    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_PADDING_SAMPLES,
-                            value, sizeof(value));
-    if(ret >= 0){
-        out->g_data.encoder_padding= atoi(value);
-        need_refresh_gapless = true;
-    }
-
-    if(need_refresh_gapless)
-        out->refresh_gapless_meta = true;
-
-    str_parms_destroy(parms);
-
-    out_set_parameters(&out->common.stream.common, kv_pairs);
-
-    ALOGV("-out_compress_set_parameters(%p)", out);
-
-    /* Its meaningless to return an error here - it's not an error if
-     * we were sent a parameter we aren't interested in
-     */
-    return 0;
-}
-
-static int do_init_out_compress(struct stream_out_compress *out,
-                                    const struct audio_config *config)
-{
-    int ret;
-
-    out->common.close = out_compress_close;
-    out->common.stream.common.standby = out_compress_standby;
-    out->common.stream.write = out_compress_write;
-    out->common.stream.pause = out_compress_pause;
-    out->common.stream.resume = out_compress_resume;
-    out->common.stream.drain = out_compress_drain;
-    out->common.stream.flush = out_compress_flush;
-    out->common.stream.get_render_position = out_compress_get_render_position;
-    out->common.stream.set_callback = out_compress_set_callback;
-    out->common.stream.common.set_parameters = out_compress_set_parameters;
-
-    /* struct is pre-initialized to 0x00 */
-    /*out->common.latency.screen_off = 0;
-    out->common.latency.screen_on = 0;
-
-    out->codec.ch_in = 0;
-    out->codec.bit_rate = 0;
-    out->codec.profile = 0;
-    out->codec.level = 0;
-    out->codec.ch_mode = 0;
-    out->codec.format = 0;*/
-    out->codec.align = 1;
-    out->codec.rate_control = SND_RATECONTROLMODE_CONSTANTBITRATE
-                                | SND_RATECONTROLMODE_VARIABLEBITRATE;
-
-    out->codec.sample_rate = config->sample_rate;
-
-    switch (config->format & AUDIO_FORMAT_MAIN_MASK) {
-        case AUDIO_FORMAT_MP3:
-            out->codec.id = SND_AUDIOCODEC_MP3;
-            break;
-        case AUDIO_FORMAT_AAC:
-            out->codec.id = SND_AUDIOCODEC_AAC;
-            break;
-        case AUDIO_FORMAT_HE_AAC_V1:
-            out->codec.id = SND_AUDIOCODEC_AAC;
-            out->codec.level = SND_AUDIOMODE_AAC_HE;
-            break;
-        case AUDIO_FORMAT_HE_AAC_V2:
-            out->codec.id = SND_AUDIOCODEC_AAC;
-            out->codec.level = SND_AUDIOMODE_AAC_HE;
-            break;
-        case AUDIO_FORMAT_VORBIS:
-            out->codec.id = SND_AUDIOCODEC_VORBIS;
-            break;
-        default:
-            return -EINVAL;
-    }
-
-    out->codec.ch_out = popcount(config->channel_mask);
-
-    /* Open compress dev to check that it exists and
-     * get the buffer size. If it isn't required soon
-     * AudioFlinger will call standby
-     */
-    ret = open_output_compress(out);
-    return ret;
-}
-#endif /* TINYHAL_COMPRESS_PLAYBACK */
-
-/*********************************************************************
- * Input stream common functions
- *********************************************************************/
+/** audio_stream_in implementation **/
 static uint32_t in_get_sample_rate(const struct audio_stream *stream)
 {
-    const struct stream_in_common *in = (struct stream_in_common *)stream;
-    uint32_t rate;
+    struct stream_in *in = (struct stream_in *)stream;
 
-    if (in->sample_rate != 0) {
-        rate = in->sample_rate;
-    } else {
-        rate = in->hw->rate;
-    }
-
-    ALOGV("in_get_sample_rate=%u", rate);
-    return rate;
+    return in->requested_rate;
 }
 
 static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
 {
-    const struct stream_in_common *in = (struct stream_in_common *)stream;
-
-    if (rate == in->sample_rate) {
-        return 0;
-    } else {
-        return -ENOTSUP;
-    }
+    (void)stream;
+    (void)rate;
+    return -ENOSYS;
 }
 
-static audio_channel_mask_t in_get_channels(const struct audio_stream *stream)
+static uint32_t in_get_channels(const struct audio_stream *stream)
 {
-    const struct stream_in_common *in = (struct stream_in_common *)stream;
-    audio_channel_mask_t mask;
+    struct stream_in *in = (struct stream_in *)stream;
 
-    if (in->channel_mask != 0) {
-        mask = in->channel_mask;
-    } else {
-        mask = IN_CHANNEL_MASK_DEFAULT;
-    }
-
-    ALOGV("in_get_channels=0x%x", mask);
-    return mask;
+    return in->main_channels;
 }
 
 static audio_format_t in_get_format(const struct audio_stream *stream)
 {
-    const struct stream_in_common *in = (struct stream_in_common *)stream;
-
-    return in->format;
+    (void)stream;
+    return AUDIO_FORMAT_PCM_16_BIT;
 }
 
 static int in_set_format(struct audio_stream *stream, audio_format_t format)
 {
     (void)stream;
     (void)format;
+
     return -ENOSYS;
 }
 
 static size_t in_get_buffer_size(const struct audio_stream *stream)
 {
-    const struct stream_in_common *in = (struct stream_in_common *)stream;
-    ALOGV("in_get_buffer_size(%p): %u", stream, in->buffer_size );
-    return in->buffer_size;
+    struct stream_in *in = (struct stream_in *)stream;
+
+    return get_input_buffer_size(in->requested_rate,
+                                 in_get_format(stream),
+                                 audio_channel_count_from_in_mask(in->main_channels),
+                                 in->usecase_type,
+                                 in->devices);
+}
+
+static int in_close_pcm_devices(struct stream_in *in)
+{
+    struct pcm_device *pcm_device;
+    struct listnode *node;
+    struct audio_device *adev = in->dev;
+
+    list_for_each(node, &in->pcm_dev_list) {
+        pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
+        if (pcm_device) {
+            if (pcm_device->pcm)
+                pcm_close(pcm_device->pcm);
+            pcm_device->pcm = NULL;
+            if (pcm_device->sound_trigger_handle > 0)
+                adev->sound_trigger_close_for_streaming(pcm_device->sound_trigger_handle);
+            pcm_device->sound_trigger_handle = 0;
+        }
+    }
+    return 0;
+}
+
+
+/* must be called with stream and hw device mutex locked */
+static int do_in_standby_l(struct stream_in *in)
+{
+    int status = 0;
+
+#ifdef PREPROCESSING_ENABLED
+    struct audio_device *adev = in->dev;
+#endif
+    if (!in->standby) {
+
+        in_close_pcm_devices(in);
+
+#ifdef PREPROCESSING_ENABLED
+        if (in->echo_reference != NULL) {
+            /* stop reading from echo reference */
+            in->echo_reference->read(in->echo_reference, NULL);
+            put_echo_reference(adev, in->echo_reference);
+            in->echo_reference = NULL;
+        }
+#ifdef HW_AEC_LOOPBACK
+        if (in->hw_echo_reference)
+        {
+            if (in->hw_ref_buf) {
+                free(in->hw_ref_buf);
+                in->hw_ref_buf = NULL;
+            }
+        }
+#endif  // HW_AEC_LOOPBACK
+#endif  // PREPROCESSING_ENABLED
+
+        status = stop_input_stream(in);
+
+        if (in->read_buf) {
+            free(in->read_buf);
+            in->read_buf = NULL;
+        }
+
+        in->standby = 1;
+    }
+    return 0;
+}
+
+// called with adev->lock_inputs locked
+static int in_standby_l(struct stream_in *in)
+{
+    struct audio_device *adev = in->dev;
+    int status = 0;
+    lock_input_stream(in);
+    if (!in->standby) {
+        pthread_mutex_lock(&adev->lock);
+        status = do_in_standby_l(in);
+        pthread_mutex_unlock(&adev->lock);
+    }
+    pthread_mutex_unlock(&in->lock);
+    return status;
+}
+
+static int in_standby(struct audio_stream *stream)
+{
+    struct stream_in *in = (struct stream_in *)stream;
+    struct audio_device *adev = in->dev;
+    int status;
+    ALOGV("%s: enter", __func__);
+    pthread_mutex_lock(&adev->lock_inputs);
+    status = in_standby_l(in);
+    pthread_mutex_unlock(&adev->lock_inputs);
+    ALOGV("%s: exit:  status(%d)", __func__, status);
+    return status;
 }
 
 static int in_dump(const struct audio_stream *stream, int fd)
 {
     (void)stream;
     (void)fd;
+
     return 0;
 }
 
 static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
 {
-    (void)stream;
-    (void)kvpairs;
-    return 0;
+    struct stream_in *in = (struct stream_in *)stream;
+    struct audio_device *adev = in->dev;
+    struct str_parms *parms;
+    char *str;
+    char value[32];
+    int ret, val = 0;
+    struct audio_usecase *uc_info;
+    bool do_standby = false;
+    struct listnode *node;
+    struct pcm_device *pcm_device;
+    struct pcm_device_profile *pcm_profile;
+
+    ALOGV("%s: enter: kvpairs=%s", __func__, kvpairs);
+    parms = str_parms_create_str(kvpairs);
+
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_INPUT_SOURCE, value, sizeof(value));
+
+    pthread_mutex_lock(&adev->lock_inputs);
+    lock_input_stream(in);
+    pthread_mutex_lock(&adev->lock);
+    if (ret >= 0) {
+        val = atoi(value);
+        /* no audio source uses val == 0 */
+        if (((int)in->source != val) && (val != 0)) {
+            in->source = val;
+        }
+    }
+
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING, value, sizeof(value));
+    if (ret >= 0) {
+        val = atoi(value);
+        if (((int)in->devices != val) && (val != 0)) {
+            in->devices = val;
+            /* If recording is in progress, change the tx device to new device */
+            if (!in->standby) {
+                uc_info = get_usecase_from_id(adev, in->usecase);
+                if (uc_info == NULL) {
+                    ALOGE("%s: Could not find the usecase (%d) in the list",
+                          __func__, in->usecase);
+                } else {
+                    if (list_empty(&in->pcm_dev_list))
+                        ALOGE("%s: pcm device list empty", __func__);
+                    else {
+                        pcm_device = node_to_item(list_head(&in->pcm_dev_list),
+                                                  struct pcm_device, stream_list_node);
+                        if ((pcm_device->pcm_profile->devices & val & ~AUDIO_DEVICE_BIT_IN) == 0) {
+                            do_standby = true;
+                        }
+                    }
+                }
+                if (do_standby) {
+                    ret = do_in_standby_l(in);
+                } else
+                    ret = select_devices(adev, in->usecase);
+            }
+        }
+    }
+    pthread_mutex_unlock(&adev->lock);
+    pthread_mutex_unlock(&in->lock);
+    pthread_mutex_unlock(&adev->lock_inputs);
+    str_parms_destroy(parms);
+
+    if (ret > 0)
+        ret = 0;
+
+    ALOGV("%s: exit: status(%d)", __func__, ret);
+    return ret;
 }
 
-static char * in_get_parameters(const struct audio_stream *stream,
-                                const char *keys)
+static char* in_get_parameters(const struct audio_stream *stream,
+                               const char *keys)
 {
     (void)stream;
     (void)keys;
+
     return strdup("");
 }
 
@@ -1336,1502 +3659,597 @@ static int in_set_gain(struct audio_stream_in *stream, float gain)
 {
     (void)stream;
     (void)gain;
+
     return 0;
+}
+
+static ssize_t read_bytes_from_dsp(struct stream_in *in, void* buffer,
+                                   size_t bytes)
+{
+    struct pcm_device *pcm_device;
+    struct audio_device *adev = in->dev;
+
+    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
+                              struct pcm_device, stream_list_node);
+
+    if (pcm_device->sound_trigger_handle > 0)
+        return adev->sound_trigger_read_samples(pcm_device->sound_trigger_handle, buffer, bytes);
+    else
+        return 0;
+}
+
+static ssize_t in_read(struct audio_stream_in *stream, void *buffer,
+                       size_t bytes)
+{
+    struct stream_in *in = (struct stream_in *)stream;
+    struct audio_device *adev = in->dev;
+    ssize_t frames = -1;
+    int ret = -1;
+    int read_and_process_successful = false;
+
+    size_t frames_rq = bytes / audio_stream_in_frame_size(stream);
+    pid_t tid;
+    int err;
+
+    /* no need to acquire adev->lock_inputs because API contract prevents a close */
+    lock_input_stream(in);
+
+    if (in->usecase == USECASE_AUDIO_CAPTURE && !in->is_fastcapture_affinity_set) {
+        tid = gettid();
+        err = fast_set_affinity(tid);
+        if (err < 0) {
+            ALOGW("Couldn't set affinity for tid %d; error %d", tid, err);
+        }
+        in->is_fastcapture_affinity_set = true;
+    }
+
+    if (in->standby) {
+        pthread_mutex_unlock(&in->lock);
+        pthread_mutex_lock(&adev->lock_inputs);
+        lock_input_stream(in);
+        if (!in->standby) {
+            pthread_mutex_unlock(&adev->lock_inputs);
+            goto false_alarm;
+        }
+        pthread_mutex_lock(&adev->lock);
+        ret = start_input_stream(in);
+        pthread_mutex_unlock(&adev->lock);
+        pthread_mutex_unlock(&adev->lock_inputs);
+        if (ret != 0) {
+            goto exit;
+        }
+        in->standby = 0;
+    }
+false_alarm:
+
+    if (!list_empty(&in->pcm_dev_list)) {
+        if (in->usecase == USECASE_AUDIO_CAPTURE_HOTWORD) {
+            bytes = read_bytes_from_dsp(in, buffer, bytes);
+            if (bytes > 0)
+                read_and_process_successful = true;
+        } else {
+            /*
+             * Read PCM and:
+             * - resample if needed
+             * - process if pre-processors are attached
+             * - discard unwanted channels
+             */
+            frames = read_and_process_frames(in, buffer, frames_rq);
+            if (frames >= 0)
+                read_and_process_successful = true;
+        }
+    }
+
+    /*
+     * Instead of writing zeroes here, we could trust the hardware
+     * to always provide zeroes when muted.
+     */
+    if (read_and_process_successful == true && adev->mic_mute)
+        memset(buffer, 0, bytes);
+
+exit:
+    pthread_mutex_unlock(&in->lock);
+
+    if (read_and_process_successful == false) {
+        in_standby(&in->stream.common);
+        ALOGV("%s: read failed - sleeping for buffer duration", __func__);
+        usleep(bytes * 1000000 / audio_stream_in_frame_size(stream) /
+               in->requested_rate);
+    }
+    return bytes;
 }
 
 static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
 {
     (void)stream;
+
     return 0;
+}
+
+static int add_remove_audio_effect(const struct audio_stream *stream,
+                                   effect_handle_t effect,
+                                   bool enable)
+{
+    struct stream_in *in = (struct stream_in *)stream;
+    struct audio_device *adev = in->dev;
+    int status = 0;
+    effect_descriptor_t desc;
+#ifdef PREPROCESSING_ENABLED
+    int i;
+#endif
+    status = (*effect)->get_descriptor(effect, &desc);
+    if (status != 0)
+        return status;
+
+    ALOGI("add_remove_audio_effect(), effect type: %08x, enable: %d ", desc.type.timeLow, enable);
+
+    pthread_mutex_lock(&adev->lock_inputs);
+    lock_input_stream(in);
+    pthread_mutex_lock(&in->dev->lock);
+#ifndef PREPROCESSING_ENABLED
+    if ((in->source == AUDIO_SOURCE_VOICE_COMMUNICATION) &&
+            in->enable_aec != enable &&
+            (memcmp(&desc.type, FX_IID_AEC, sizeof(effect_uuid_t)) == 0)) {
+        in->enable_aec = enable;
+        if (!in->standby)
+            select_devices(in->dev, in->usecase);
+    }
+#else
+    if ( (in->num_preprocessors > MAX_PREPROCESSORS) && (enable == true) ) {
+        status = -ENOSYS;
+        goto exit;
+    }
+    if ( enable == true ) {
+        in->preprocessors[in->num_preprocessors].effect_itfe = effect;
+        /* add the supported channel of the effect in the channel_configs */
+        in_read_audio_effect_channel_configs(in, &in->preprocessors[in->num_preprocessors]);
+        in->num_preprocessors ++;
+        /* check compatibility between main channel supported and possible auxiliary channels */
+        in_update_aux_channels(in, effect);//wesley crash
+        in->aux_channels_changed = true;
+    } else {
+        /* if ( enable == false ) */
+        if (in->num_preprocessors <= 0) {
+            status = -ENOSYS;
+            goto exit;
+        }
+        status = -EINVAL;
+        for (i=0; i < in->num_preprocessors; i++) {
+            if (status == 0) { /* status == 0 means an effect was removed from a previous slot */
+                in->preprocessors[i - 1].effect_itfe = in->preprocessors[i].effect_itfe;
+                in->preprocessors[i - 1].channel_configs = in->preprocessors[i].channel_configs;
+                in->preprocessors[i - 1].num_channel_configs =
+                    in->preprocessors[i].num_channel_configs;
+                ALOGV("add_remove_audio_effect moving fx from %d to %d", i, i-1);
+                continue;
+            }
+            if ( in->preprocessors[i].effect_itfe == effect ) {
+                ALOGV("add_remove_audio_effect found fx at index %d", i);
+                free(in->preprocessors[i].channel_configs);
+                status = 0;
+            }
+        }
+        if (status != 0)
+            goto exit;
+        in->num_preprocessors--;
+        /*  if we remove one effect, at least the last proproc should be reset */
+        in->preprocessors[in->num_preprocessors].num_channel_configs = 0;
+        in->preprocessors[in->num_preprocessors].effect_itfe = NULL;
+        in->preprocessors[in->num_preprocessors].channel_configs = NULL;
+        in->aux_channels_changed = false;
+        ALOGV("%s: enable(%d), in->aux_channels_changed(%d)", __func__, enable, in->aux_channels_changed);
+    }
+    ALOGI("%s:  num_preprocessors = %d", __func__, in->num_preprocessors);
+
+    if ( memcmp(&desc.type, FX_IID_AEC, sizeof(effect_uuid_t)) == 0) {
+        in->enable_aec = enable;
+        ALOGV("add_remove_audio_effect(), FX_IID_AEC, enable: %d", enable);
+        if (!in->standby) {
+            select_devices(in->dev, in->usecase);
+            do_in_standby_l(in);
+        }
+        if (in->enable_aec == true) {
+            in_configure_reverse(in);
+        }
+    }
+exit:
+#endif
+    ALOGW_IF(status != 0, "add_remove_audio_effect() error %d", status);
+    pthread_mutex_unlock(&in->dev->lock);
+    pthread_mutex_unlock(&in->lock);
+    pthread_mutex_unlock(&adev->lock_inputs);
+    return status;
 }
 
 static int in_add_audio_effect(const struct audio_stream *stream,
                                effect_handle_t effect)
 {
-    (void)stream;
-    (void)effect;
-    return 0;
+    ALOGV("%s: effect %p", __func__, effect);
+    return add_remove_audio_effect(stream, effect, true);
 }
 
 static int in_remove_audio_effect(const struct audio_stream *stream,
                                   effect_handle_t effect)
 {
-    (void)stream;
-    (void)effect;
-    return 0;
+    ALOGV("%s: effect %p", __func__, effect);
+    return add_remove_audio_effect(stream, effect, false);
 }
 
-static void do_in_set_read_timestamp(struct stream_in_common *in)
-{
-    nsecs_t ns = systemTime(SYSTEM_TIME_MONOTONIC);
-
-    /* 0 is used to mean we don't have a timestamp, so if */
-    /* time count wraps to zero change it to 1 */
-    if (ns == 0) {
-        ns = 1;
-    }
-
-    in->last_read_ns = ns;
-}
-
-/*
- * Delay for the time it would have taken to read <bytes> since the last
- * read at the stream sample rate
- */
-static void do_in_realtime_delay(struct stream_in_common *in, size_t bytes)
-{
-    size_t required_interval;
-    nsecs_t required_ns;
-    nsecs_t elapsed_ns;
-    struct timespec ts;
-
-    if (in->last_read_ns != 0) {
-        /* required interval is calculated so that a left shift 19 places
-         * converts approximately to nanoseconds. This avoids the overhead
-         * of having to do a 64-bit division if we worked entirely in
-         * nanoseconds, and of a large multiply by 1000000 to convert
-         * milliseconds to 64-bit nanoseconds.
-         * (1907 << 19) = 999817216
-         */
-        required_interval = (1907 * bytes) / (in->frame_size * in->sample_rate);
-        required_ns = (nsecs_t)required_interval << 19;
-        elapsed_ns = systemTime(SYSTEM_TIME_MONOTONIC) - in->last_read_ns;
-
-        /* use ~millisecond accurace to ignore trivial nanosecond differences */
-        if (required_interval > (elapsed_ns >> 19)) {
-            ts.tv_sec = 0;
-            ts.tv_nsec = required_ns - elapsed_ns;
-            nanosleep(&ts, NULL);
-        }
-    }
-}
-
-static void do_close_in_common(struct audio_stream *stream)
-{
-    struct stream_in_common *in = (struct stream_in_common *)stream;
-    struct audio_device *adev = in->dev;
-
-    in->stream.common.standby(stream);
-
-    /* active_voice_control is not cleared by standby so we must
-     * clear it here when stream is closed
-     */
-    pthread_mutex_lock(&adev->lock);
-    if ((struct stream_in_common *)in->dev->active_voice_control == in) {
-        in->dev->active_voice_control = NULL;
-        voice_trigger_audio_ended_locked(adev);
-    }
-    pthread_mutex_unlock(&adev->lock);
-
-    if (in->hw != NULL) {
-        release_stream(in->hw);
-    }
-
-    free(stream);
-}
-
-static int do_init_in_common( struct stream_in_common *in,
-                                const struct audio_config *config,
-                                audio_devices_t devices )
-{
-    in->standby = true;
-
-    in->close = do_close_in_common;
-    in->stream.common.get_sample_rate = in_get_sample_rate;
-    in->stream.common.set_sample_rate = in_set_sample_rate;
-    in->stream.common.get_buffer_size = in_get_buffer_size;
-    in->stream.common.get_channels = in_get_channels;
-    in->stream.common.get_format = in_get_format;
-    in->stream.common.set_format = in_set_format;
-    in->stream.common.dump = in_dump;
-    in->stream.common.set_parameters = in_set_parameters;
-    in->stream.common.get_parameters = in_get_parameters;
-    in->stream.common.add_audio_effect = in_add_audio_effect;
-    in->stream.common.remove_audio_effect = in_remove_audio_effect;
-    in->stream.set_gain = in_set_gain;
-    in->stream.get_input_frames_lost = in_get_input_frames_lost;
-
-    /* init requested stream config */
-    in->format = config->format;
-    in->sample_rate = config->sample_rate;
-    in->channel_mask = config->channel_mask;
-    in->channel_count = popcount(in->channel_mask);
-
-#ifdef AUDIO_DEVICE_API_VERSION_3_0
-    in->frame_size = audio_stream_in_frame_size(&in->stream);
-#else
-    in->frame_size = audio_stream_frame_size(&in->stream.common);
-#endif
-    /* Save devices so we can apply initial routing after we've
-     * been told the input_source and opened the stream
-     */
-    in->devices = devices;
-
-    return 0;
-}
-
-/*********************************************************************
- * PCM input resampler handling
- *********************************************************************/
-static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
-                                   struct resampler_buffer* buffer)
-{
-    struct in_resampler *rsp;
-    struct stream_in_pcm *in;
-
-    if (buffer_provider == NULL || buffer == NULL) {
-        return -EINVAL;
-    }
-
-    rsp = (struct in_resampler *)((char *)buffer_provider -
-                                   offsetof(struct in_resampler, buf_provider));
-    in = (struct stream_in_pcm *)((char *)rsp -
-                                   offsetof(struct stream_in_pcm, resampler));
-
-    if (in->pcm == NULL) {
-        buffer->raw = NULL;
-        buffer->frame_count = 0;
-        rsp->read_status = -ENODEV;
-        return -ENODEV;
-    }
-
-    if (rsp->frames_in == 0) {
-        rsp->read_status = pcm_readi(in->pcm,
-                                   (void*)rsp->buffer,
-                                   pcm_bytes_to_frames(in->pcm, rsp->in_buffer_size));
-        if (rsp->read_status < 0) {
-            ALOGE("get_next_buffer() pcm_read error %d", errno);
-            buffer->raw = NULL;
-            buffer->frame_count = 0;
-            return rsp->read_status;
-        }
-        rsp->frames_in = rsp->in_buffer_frames;
-        if ((in->common.channel_count == 1) && (in->hw_channel_count == 2)) {
-            unsigned int i;
-
-            /* Discard right channel */
-            for (i = 1; i < rsp->frames_in; i++) {
-                rsp->buffer[i] = rsp->buffer[i * 2];
-            }
-        }
-    }
-
-    buffer->frame_count = (buffer->frame_count > rsp->frames_in) ?
-                                rsp->frames_in : buffer->frame_count;
-    buffer->i16 = (int16_t*)rsp->buffer + ((rsp->in_buffer_frames - rsp->frames_in));
-
-    return rsp->read_status;
-}
-
-static void release_buffer(struct resampler_buffer_provider *buffer_provider,
-                                  struct resampler_buffer* buffer)
-{
-    struct in_resampler *rsp;
-    struct stream_in_pcm *in;
-
-    if (buffer_provider == NULL || buffer == NULL)
-        return;
-
-    rsp = (struct in_resampler *)((char *)buffer_provider -
-                                   offsetof(struct in_resampler, buf_provider));
-    in = (struct stream_in_pcm *)((char *)rsp -
-                                   offsetof(struct stream_in_pcm, resampler));
-
-    rsp->frames_in -= buffer->frame_count;
-}
-
-static ssize_t read_resampled_frames(struct stream_in_pcm *in,
-                                      void *buffer, ssize_t frames)
-{
-    struct in_resampler *rsp = &in->resampler;
-    ssize_t frames_wr = 0;
-
-    while (frames_wr < frames) {
-        size_t frames_rd = frames - frames_wr;
-        rsp->resampler->resample_from_provider(rsp->resampler,
-                                        (int16_t *)((char *)buffer +
-                                                (frames_wr * in->common.frame_size)),
-                                        &frames_rd);
-        if (rsp->read_status != 0) {
-            return rsp->read_status;
-        }
-
-        frames_wr += frames_rd;
-    }
-    return frames_wr;
-}
-
-static int in_resampler_init(struct stream_in_pcm *in, int hw_rate,
-                             int channels, size_t hw_fragment)
-{
-    struct in_resampler *rsp = &in->resampler;
-    int ret = 0;
-
-    rsp->in_buffer_size = hw_fragment * channels * in->common.frame_size;
-    rsp->in_buffer_frames = rsp->in_buffer_size /
-                                        (channels * in->common.frame_size);
-    rsp->buffer = malloc(rsp->in_buffer_size);
-
-    if (!rsp->buffer) {
-        ret = -ENOMEM;
-    } else {
-        rsp->buf_provider.get_next_buffer = get_next_buffer;
-        rsp->buf_provider.release_buffer = release_buffer;
-
-        ret = create_resampler(hw_rate,
-                               in->common.sample_rate,
-                               in->common.channel_count,
-                               RESAMPLER_QUALITY_DEFAULT,
-                               &rsp->buf_provider,
-                               &rsp->resampler);
-    }
-
-    if (ret < 0) {
-        free(rsp->buffer);
-        rsp->buffer = NULL;
-    }
-
-    return ret;
-}
-
-static void in_resampler_free(struct stream_in_pcm *in)
-{
-    if (in->resampler.resampler) {
-        release_resampler(in->resampler.resampler);
-        in->resampler.resampler = NULL;
-    }
-
-    free(in->resampler.buffer);
-    in->resampler.buffer = NULL;
-}
-
-/*********************************************************************
- * Unshorten wrapper
- *********************************************************************/
-
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-static int in_unshorten_read(struct stream_in_pcm *in,
-                                        char *dst, const size_t bytes)
-{
-    struct in_unshorten * const u = &in->unshorten;
-    size_t avail = 0;
-    size_t count = bytes;
-    const char *p;
-    size_t len;
-    int status;
-    int ret = 0;
-
-    ALOGV("+do_in_compress_pcm_unshorten %u", bytes);
-
-    if (u->accumulator_avail != 0) {
-        len = u->accumulator_avail;
-        if (len > count) {
-            len = count;
-        }
-
-        memcpy(dst, u->accumulator_p, len);
-
-        u->accumulator_avail -= len;
-        u->accumulator_p += len;
-        count -= len;
-        dst += len;
-    }
-
-    while (count > 0) {
-        status = unshorten_process(&u->unshorten);
-
-        if (status & UNSHORTEN_CORRUPT) {
-            ALOGE("shortened data is corrupt\n");
-            ret = -EINVAL;
-            goto out;
-        } else if (status & UNSHORTEN_OUTPUT_AVAILABLE) {
-            len = UNSHORTEN_OUTPUT_SIZE(status) * sizeof(Sample);
-            p = (const char *)unshorten_extract_output(&u->unshorten);
-
-            if (len <= count) {
-                memcpy(dst, p, len);
-                dst += len;
-                count -= len;
-            } else {
-                memcpy(dst, p, count);
-
-                len -= count;
-                if (len > u->accumulator_buf_size) {
-                    ALOGW("unshorten overflows accumulator");
-                    len = u->accumulator_buf_size;
-                }
-                memcpy(u->accumulator_buf, p + count, len);
-                u->accumulator_p = u->accumulator_buf;
-                u->accumulator_avail = len;
-                count = 0;
-                break;
-            }
-        } else if (status & UNSHORTEN_INPUT_REQUIRED) {
-            ret = compress_read(in->compress, u->in_buffer, u->in_buffer_size);
-            if (ret <= 0) {
-                ALOGV("No audio to unshorten");
-                break;
-            }
-
-            ret = unshorten_supply_input(&u->unshorten, u->in_buffer, ret);
-            if (ret != 0) {
-                break;
-            }
-        }
-    }
-out:
-    if (ret >= 0) {
-        ret = bytes - count;
-    }
-
-    ALOGV("-do_in_compress_pcm_unshorten %d", ret);
-    return bytes - count;
-}
-#endif
-
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-static int in_unshorten_init(struct in_unshorten *u, const struct compr_config *config)
-{
-    int ret;
-
-    u->in_buffer_size = config->fragment_size;
-    u->accumulator_buf_size = config->fragment_size * 2;
-    u->in_buffer = malloc(u->in_buffer_size);
-    u->accumulator_buf = malloc(u->accumulator_buf_size);
-
-    if ((u->in_buffer == NULL) || (u->accumulator_buf == NULL)) {
-        ret = -ENOMEM;
-        goto fail;
-    }
-
-    ret = init_unshorten(&u->unshorten);
-    if (ret != 0) {
-        ALOGE("Failed to create unshorten data (%d)", ret);
-        goto fail;
-    }
-
-    u->accumulator_avail = 0;
-    return 0;
-
-fail:
-    free(u->in_buffer);
-    free(u->accumulator_buf);
-    return ret;
-}
-#endif
-
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-static void in_unshorten_free(struct in_unshorten *u)
-{
-    free_unshorten(&u->unshorten);
-    free(u->in_buffer);
-    free(u->accumulator_buf);
-}
-#endif
-
-/*********************************************************************
- * PCM input stream via compressed channel
- *********************************************************************/
-
-/* must be called with hw device and input stream mutexes locked */
-static int do_open_compress_pcm_in(struct stream_in_pcm *in)
-{
-    struct snd_codec codec;
-    struct compress *compress;
-    int ret;
-
-    ALOGV("+do_open_compress_pcm_in");
-
-    if (in->common.hw == NULL) {
-        ALOGW("input_source not set");
-        ret = -EINVAL;
-        goto exit;
-    }
-
-    memset(&codec, 0, sizeof(codec));
-    codec.id = SND_AUDIOCODEC_PCM;
-    codec.ch_in = in->common.channel_count;
-    codec.sample_rate = in->common.sample_rate;
-    codec.format = SNDRV_PCM_FORMAT_S16_LE;
-
-    /* Fragment and buffer sizes should be configurable or auto-detected
-     * but are currently just hardcoded
-     */
-    struct compr_config config = {
-        .fragment_size = 4096,
-        .fragments = 1,
-        .codec = &codec
-    };
-
-    compress = compress_open(in->common.hw->card_number,
-                                in->common.hw->device_number,
-                                COMPRESS_OUT,
-                                &config);
-
-    if (!compress || !is_compress_ready(compress)) {
-        ret = errno;
-        ALOGE_IF(compress,"compress_open(in) failed: %s", compress_get_error(compress));
-        ALOGE_IF(!compress,"compress_open(in) failed");
-        compress_close(compress);
-        goto exit;
-    }
-
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-    ret = in_unshorten_init(&in->unshorten, &config);
-    if (ret < 0) {
-        compress_close(compress);
-        goto exit;
-    }
-#endif
-
-    in->compress = compress;
-    in->common.buffer_size = config.fragment_size * config.fragments * in->common.frame_size;
-    compress_start(in->compress);
-    ret = 0;
-
-exit:
-    ALOGV("-do_open_compress_pcm_in (%d)", ret);
-    return ret;
-}
-
-/* must be called with hw device and input stream mutexes locked */
-static int start_compress_pcm_input_stream(struct stream_in_pcm *in)
-{
-    struct audio_device *adev = in->common.dev;
-    int ms;
-    int ret;
-
-    ALOGV("start_compress_pcm_input_stream");
-
-    if (in->common.standby) {
-        ret = do_open_compress_pcm_in(in);
-        if (ret < 0) {
-            return ret;
-        }
-
-        /*
-         * We must not block AudioFlinger so limit the time that tinycompress
-         * will block for data to around twice the time it would take to fetch
-         * a buffer of data at the configured sample rate
-         */
-        ms = (1000LL * in->common.buffer_size) / (in->common.frame_size *
-                                                  in->common.sample_rate);
-
-        compress_set_max_poll_wait(in->compress, ms * 2);
-
-        in->common.standby = 0;
-    }
-
-    return 0;
-}
-
-/* must be called with hw device and input stream mutexes locked */
-static void do_in_compress_pcm_standby(struct stream_in_pcm *in)
-{
-    struct compress *c;
-    int ret;
-
-    ALOGV("+do_in_compress_pcm_standby");
-
-    if (!in->common.standby) {
-        c = in->compress;
-        in->compress = NULL;
-        compress_stop(c);
-        compress_close(c);
-
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-        in_unshorten_free(&in->unshorten);
-#endif
-    }
-    in->common.standby = true;
-
-    ALOGV("-do_in_compress_pcm_standby");
-}
-
-static ssize_t do_in_compress_pcm_read(struct audio_stream_in *stream, void* buffer,
-                                        size_t bytes)
-{
-    struct stream_in_pcm *in = (struct stream_in_pcm *)stream;
-    struct audio_device *adev = in->common.dev;
-    int ret = 0;
-
-    ALOGV("+do_in_compress_pcm_read %d", bytes);
-
-    pthread_mutex_lock(&in->common.lock);
-    ret = start_compress_pcm_input_stream(in);
-
-    if (ret < 0) {
-        goto exit;
-    }
-
-#ifdef COMPRESS_PCM_USE_UNSHORTEN
-    ret = in_unshorten_read(in, buffer, bytes);
-#else
-    ret = compress_read(in->compress, buffer, bytes);
-#endif
-    ALOGV_IF(ret == 0, "no data");
-
-    if (ret > 0) {
-        /*
-         * The interface between AudioFlinger and AudioRecord cannot cope
-         * with bursty or high-speed data and will lockup for periods if
-         * the data arrives faster than the app reads it. So we must limit
-         * the rate that we deliver PCM buffers to avoid triggering this
-         * condition. Allow data to be returned up to 4x realtime
-         */
-        do_in_realtime_delay(&in->common, bytes / 4);
-    }
-
-exit:
-    pthread_mutex_unlock(&in->common.lock);
-
-    ALOGV("-do_in_compress_pcm_read (%d)", ret);
-    return ret;
-}
-
-static void do_in_compress_pcm_close(struct stream_in_pcm *in)
-{
-    ALOGV("+do_in_compress_pcm_close");
-
-    if (in->compress != NULL) {
-        compress_stop(in->compress);
-        compress_close(in->compress);
-    }
-
-    ALOGV("-do_in_compress_pcm_close");
-}
-
-/*********************************************************************
- * PCM input stream
- *********************************************************************/
-
-static unsigned int in_pcm_cfg_period_count(struct stream_in_pcm *in)
-{
-    if (in->common.hw->period_count != 0) {
-        return in->common.hw->period_count;
-    } else {
-        return IN_PERIOD_COUNT_DEFAULT;
-    }
-}
-
-static unsigned int in_pcm_cfg_period_size(struct stream_in_pcm *in)
-{
-    if (in->common.hw->period_size != 0) {
-        return in->common.hw->period_size;
-    } else {
-        return IN_PERIOD_SIZE_DEFAULT;
-    }
-}
-
-static unsigned int in_pcm_cfg_rate(struct stream_in_pcm *in)
-{
-    if (in->common.hw->rate != 0) {
-        return in->common.hw->rate;
-    } else {
-        return IN_RATE_DEFAULT;
-    }
-}
-
-static unsigned int in_pcm_cfg_channel_count(struct stream_in_pcm *in)
-{
-    if (in->common.channel_count != 0) {
-        return in->common.channel_count;
-    } else {
-        return IN_CHANNEL_COUNT_DEFAULT;
-    }
-}
-
-/* must be called with hw device and input stream mutexes locked */
-static void do_in_pcm_standby(struct stream_in_pcm *in)
-{
-    struct audio_device *adev = in->common.dev;
-
-    ALOGV("+do_in_pcm_standby");
-
-    if (!in->common.standby) {
-        pcm_close(in->pcm);
-        in->pcm = NULL;
-    }
-
-    in_resampler_free(in);
-    in->common.standby = true;
-
-    ALOGV("-do_in_pcm_standby");
-}
-
-static void in_pcm_fill_params(struct stream_in_pcm *in,
-                                const struct pcm_config *config )
-{
-    size_t size;
-
-    in->hw_sample_rate = config->rate;
-    in->hw_channel_count = config->channels;
-    in->period_size = config->period_size;
-
-    /*
-     * take resampling into account and return the closest majoring
-     * multiple of 16 frames, as audioflinger expects audio buffers to
-     * be a multiple of 16 frames
-     */
-    size = (config->period_size * in->common.sample_rate) / config->rate;
-    size = ((size + 15) / 16) * 16;
-    in->common.buffer_size = size * in->common.frame_size;
-
-}
-
-/* must be called with hw device and input stream mutexes locked */
-static int do_open_pcm_input(struct stream_in_pcm *in)
-{
-    struct pcm_config config;
-    int ret;
-
-    ALOGV("+do_open_pcm_input");
-
-    if (in->common.hw == NULL) {
-        ALOGW("input_source not set");
-        ret = -EINVAL;
-        goto exit;
-    }
-
-    memset(&config, 0, sizeof(config));
-    config.channels = in_pcm_cfg_channel_count(in);
-    config.rate = in_pcm_cfg_rate(in),
-    config.period_size = in_pcm_cfg_period_size(in),
-    config.period_count = in_pcm_cfg_period_count(in),
-    config.format = PCM_FORMAT_S16_LE,
-    config.start_threshold = 0;
-
-    in->pcm = pcm_open(in->common.hw->card_number,
-                       in->common.hw->device_number,
-                       PCM_IN,
-                       &config);
-
-    if (!in->pcm || !pcm_is_ready(in->pcm)) {
-        ALOGE_IF(in->pcm,"pcm_open(in) failed: %s", pcm_get_error(in->pcm));
-        ALOGE_IF(!in->pcm,"pcm_open(in) failed");
-        ret = -ENOMEM;
-        goto fail;
-    }
-
-    in_pcm_fill_params( in, &config );
-
-    ALOGV("input buffer size=0x%x", in->common.buffer_size);
-
-    /*
-     * If the stream rate differs from the PCM rate, we need to
-     * create a resampler.
-     */
-    if (in_get_sample_rate(&in->common.stream.common) != config.rate) {
-        ret = in_resampler_init(in, config.rate, config.channels,
-                                pcm_frames_to_bytes(in->pcm, config.period_size));
-        if (ret < 0) {
-            goto fail;
-        }
-    }
-    ALOGV("-do_open_pcm_input");
-    return 0;
-
-fail:
-    pcm_close(in->pcm);
-    in->pcm = NULL;
-exit:
-    ALOGV("-do_open_pcm_input error:%d", ret);
-    return ret;
-}
-
-/* must be called with hw device and input stream mutexes locked */
-static int start_pcm_input_stream(struct stream_in_pcm *in)
-{
-    int ret = 0;
-
-    if (in->common.standby) {
-        ret = do_open_pcm_input(in);
-        if (ret == 0) {
-            in->common.standby = 0;
-        }
-    }
-
-    return ret;
-}
-
-static int change_input_source_locked(struct stream_in_pcm *in, const char *value,
-                                uint32_t devices, bool *was_changed)
-{
-    struct audio_device *adev = in->common.dev;
-    struct audio_config config;
-    const char *stream_name;
-    const struct hw_stream *hw = NULL;
-    bool voice_control = false;
-    const int new_source = atoi(value);
-
-    *was_changed = false;
-
-    if (!in->common.standby) {
-        ALOGE("attempt to change input source while active");
-        return -EINVAL;
-    }
-
-    if (in->common.input_source == new_source) {
-        ALOGV("input source not changed");
-        return 0;
-    }
-
-    /* Special input sources are obtained from the configuration
-     * by opening a named stream
-     */
-    switch (new_source) {
-    case AUDIO_SOURCE_VOICE_RECOGNITION:
-        /* We should verify here that current frame size, sample rate and
-         * channels are compatible
-         */
-
-        /* depends on voice recognition type and state whether we open
-         * the voice recognition stream or generic PCM stream
-         */
-        stream_name = voice_trigger_audio_stream_name(adev);
-        voice_control = true;
-        break;
-
-    default:
-        stream_name = NULL;
-        break;
-    }
-
-    if (stream_name) {
-        /* try to open a stream specific to the chosen input source */
-        hw = get_named_stream(in->common.dev->cm, stream_name);
-        ALOGV_IF(hw != NULL, "Changing input source to %s", stream_name);
-    }
-
-    if (!hw) {
-        /* open generic PCM input stream */
-        memset(&config, 0, sizeof(config));
-        config.sample_rate = in->common.sample_rate;
-        config.channel_mask = in->common.channel_mask;
-        config.format = in->common.format;
-        hw = get_stream(in->common.dev->cm, devices, 0, &config);
-        ALOGV_IF(hw != NULL, "Changing to default input source for devices 0x%x",
-                        devices);
-    }
-
-    if (hw != NULL) {
-        /* A normal stream will be in standby and therefore device node */
-        /* is closed when we get here. */
-
-        if (in->common.hw != NULL) {
-            release_stream(in->common.hw);
-        }
-
-        in->common.hw = hw;
-
-        pthread_mutex_lock(&adev->lock);
-        if (voice_control) {
-            adev->active_voice_control = in;
-            voice_trigger_audio_started_locked(adev);
-        } else if (adev->active_voice_control == in) {
-            adev->active_voice_control = NULL;
-            voice_trigger_audio_ended_locked(adev);
-        }
-        pthread_mutex_unlock(&adev->lock);
-
-        in->common.input_source = new_source;
-        *was_changed = true;
-        return 0;
-    } else {
-        ALOGV("Could not open new input stream");
-        return -EINVAL;
-    }
-}
-
-static ssize_t do_in_pcm_read(struct audio_stream_in *stream, void* buffer,
-                       size_t bytes)
-{
-    int ret = 0;
-    struct stream_in_pcm *in = (struct stream_in_pcm *)stream;
-    struct audio_device *adev = in->common.dev;
-    size_t frames_rq = bytes / in->common.frame_size;
-
-    ALOGV("+do_in_pcm_read %d", bytes);
-
-    pthread_mutex_lock(&in->common.lock);
-    ret = start_pcm_input_stream(in);
-
-    if (ret < 0) {
-        goto exit;
-    }
-
-    if (in->resampler.resampler != NULL) {
-        ret = read_resampled_frames(in, buffer, frames_rq);
-    } else {
-        ret = pcm_readi(in->pcm, buffer, pcm_bytes_to_frames(in->pcm, bytes));
-    }
-
-    /* Assume any non-negative return is a successful read */
-    if (ret >= 0) {
-        ret = bytes;
-    }
-
-exit:
-    pthread_mutex_unlock(&in->common.lock);
-
-    ALOGV("-do_in_pcm_read (%d)", ret);
-    return ret;
-}
-
-static int in_pcm_standby(struct audio_stream *stream)
-{
-    struct stream_in_pcm *in = (struct stream_in_pcm *)stream;
-
-    pthread_mutex_lock(&in->common.lock);
-
-    if (in->common.hw != NULL) {
-        if (stream_is_compressed_in(in->common.hw)) {
-            do_in_compress_pcm_standby(in);
-        } else {
-            do_in_pcm_standby(in);
-        }
-    }
-
-    pthread_mutex_unlock(&in->common.lock);
-
-    return 0;
-}
-
-static ssize_t in_pcm_read(struct audio_stream_in *stream, void* buffer,
-                       size_t bytes)
-{
-    struct stream_in_pcm *in = (struct stream_in_pcm *)stream;
-    struct audio_device *adev = in->common.dev;
-    int ret;
-
-    if (in->common.hw == NULL) {
-        ALOGW("in_pcm_read(%p): no input source for stream", stream);
-        ret = -EINVAL;
-    } else if (get_current_routes(in->common.hw) == 0) {
-        ALOGV("in_pcm_read(%p) (no routes)", stream);
-        ret = -EINVAL;
-    } else {
-        if (stream_is_compressed_in(in->common.hw)) {
-            ret = do_in_compress_pcm_read(stream, buffer, bytes);
-        } else {
-            ret = do_in_pcm_read(stream, buffer, bytes);
-        }
-    }
-
-    /* If error, no data or muted, return a buffer of zeros and delay
-     * for the time it would take to capture that much audio at the
-     * current sample rate. AudioFlinger can't do anything useful with
-     * read errors so convert errors into a read of silence
-     */
-    if ((ret <= 0) || adev->mic_mute) {
-        memset(buffer, 0, bytes);
-
-        /* Only delay if we failed to capture any audio */
-        if (ret <= 0) {
-            do_in_realtime_delay(&in->common, bytes);
-        }
-
-        ret = bytes;
-    }
-
-    do_in_set_read_timestamp(&in->common);
-
-    return ret;
-}
-
-static int in_pcm_set_parameters(struct audio_stream *stream, const char *kvpairs)
-{
-    struct stream_in_pcm *in = (struct stream_in_pcm *)stream;
-    struct audio_device *adev = in->common.dev;
-    struct str_parms *parms;
-    char value[32];
-    uint32_t new_routing = 0;
-    bool routing_changed;
-    uint32_t devices;
-    bool input_was_changed;
-    int ret;
-
-    ALOGV("+in_pcm_set_parameters(%p) '%s'", stream, kvpairs);
-
-    ret = common_get_routing_param(&new_routing, kvpairs);
-    routing_changed = (ret >= 0);
-    parms = str_parms_create_str(kvpairs);
-
-    pthread_mutex_lock(&in->common.lock);
-
-    if(str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_INPUT_SOURCE,
-                            value, sizeof(value)) >= 0) {
-
-        if (routing_changed) {
-            devices = new_routing;
-        } else if (in->common.hw != NULL) {
-            /* Route new stream to same devices as current stream */
-            devices = get_routed_devices(in->common.hw);
-        } else {
-            devices = 0;
-        }
-
-        ret = change_input_source_locked(in, value, devices, &input_was_changed);
-        if (ret < 0) {
-            goto out;
-        }
-
-        /* We must apply any existing routing to the new stream */
-        new_routing = devices;
-        routing_changed = true;
-    }
-
-    if (routing_changed) {
-        in->common.devices = new_routing;
-
-        if (in->common.hw) {
-            ALOGV("Apply routing=0x%x to input stream", new_routing);
-            apply_route(in->common.hw, new_routing);
-        }
-        ret = 0;
-    }
-
-    stream_invoke_usecases(in->common.hw, kvpairs);
-
-out:
-    pthread_mutex_unlock(&in->common.lock);
-    str_parms_destroy(parms);
-
-    ALOGV("-in_pcm_set_parameters(%p)", stream);
-
-    /* Its meaningless to return an error here - it's not an error if
-     * we were sent a parameter we aren't interested in
-     */
-    return 0;
-}
-
-static void do_close_in_pcm(struct audio_stream *stream)
-{
-    struct stream_in_pcm *in = (struct stream_in_pcm *)stream;
-
-    if (in->common.hw != NULL) {
-        if (stream_is_compressed(in->common.hw)) {
-            do_in_compress_pcm_close(in);
-        }
-    }
-
-    do_close_in_common(stream);
-}
-
-static int do_init_in_pcm( struct stream_in_pcm *in,
-                                    struct audio_config *config )
-{
-    in->common.close = do_close_in_pcm;
-    in->common.stream.common.standby = in_pcm_standby;
-    in->common.stream.common.set_parameters = in_pcm_set_parameters;
-    in->common.stream.read = in_pcm_read;
-
-    /* Although AudioFlinger has not yet told us the input_source for
-     * this stream, it expects us to already know the buffer size.
-     * We just have to hardcode something that might work
-     */
-    in->common.buffer_size = IN_COMPRESS_BUFFER_SIZE_DEFAULT;
-
-    return 0;
-}
-
-/*********************************************************************
- * Stream open and close
- *********************************************************************/
 static int adev_open_output_stream(struct audio_hw_device *dev,
                                    audio_io_handle_t handle,
                                    audio_devices_t devices,
                                    audio_output_flags_t flags,
                                    struct audio_config *config,
-                                   struct audio_stream_out **stream_out
-#ifdef AUDIO_DEVICE_API_VERSION_3_0
-                                   , const char *address
-#endif
-                                   )
+                                   struct audio_stream_out **stream_out,
+                                   const char *address __unused)
 {
     struct audio_device *adev = (struct audio_device *)dev;
-    union {
-        struct stream_out_common *common;
-        struct stream_out_pcm *pcm;
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-        struct stream_out_compress *compress;
-#endif
-    } out;
-    int ret;
+    struct stream_out *out;
+    int i, ret;
+    struct pcm_device_profile *pcm_profile;
 
-    ALOGV("+adev_open_output_stream");
+    ALOGV("%s: enter: sample_rate(%d) channel_mask(%#x) devices(%#x) flags(%#x)",
+          __func__, config->sample_rate, config->channel_mask, devices, flags);
+    *stream_out = NULL;
+    out = (struct stream_out *)calloc(1, sizeof(struct stream_out));
 
-    devices &= AUDIO_DEVICE_OUT_ALL;
-    const struct hw_stream *hw = get_stream(adev->cm, devices, flags, config);
-    if (!hw) {
-        ALOGE("No suitable output stream for devices=0x%x flags=0x%x format=0x%x",
-                    devices, flags, config->format );
+    if (devices == AUDIO_DEVICE_NONE)
+        devices = AUDIO_DEVICE_OUT_SPEAKER;
+
+    out->flags = flags;
+    out->devices = devices;
+    out->dev = adev;
+    out->format = config->format;
+    out->sample_rate = config->sample_rate;
+    out->channel_mask = AUDIO_CHANNEL_OUT_STEREO;
+    out->supported_channel_masks[0] = AUDIO_CHANNEL_OUT_STEREO;
+    out->handle = handle;
+
+    pcm_profile = get_pcm_device(PCM_PLAYBACK, devices);
+    if (pcm_profile == NULL) {
         ret = -EINVAL;
-        goto err_fail;
+        goto error_open;
     }
+    out->config = pcm_profile->config;
 
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-    out.common = calloc(1, hw->type == e_stream_out_pcm
-                                ? sizeof(struct stream_out_pcm)
-                                : sizeof(struct stream_out_compress));
-#else
-    out.common = calloc(1, sizeof(struct stream_out_pcm));
-#endif
+    /* Init use case and pcm_config */
+    if (out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
+        if (config->offload_info.version != AUDIO_INFO_INITIALIZER.version ||
+            config->offload_info.size != AUDIO_INFO_INITIALIZER.size) {
+            ALOGE("%s: Unsupported Offload information", __func__);
+            ret = -EINVAL;
+            goto error_open;
+        }
+        if (!is_supported_format(config->offload_info.format)) {
+            ALOGE("%s: Unsupported audio format", __func__);
+            ret = -EINVAL;
+            goto error_open;
+        }
 
-    if (!out.common) {
-        ret = -ENOMEM;
-        goto err_fail;
-    }
+        out->compr_config.codec = (struct snd_codec *)
+                                    calloc(1, sizeof(struct snd_codec));
 
-    out.common->dev = adev;
-    out.common->hw = hw;
-    ret = do_init_out_common( out.common, config, devices );
-    if (ret < 0) {
-        goto err_open;
-    }
+        out->usecase = USECASE_AUDIO_PLAYBACK_OFFLOAD;
+        if (config->offload_info.channel_mask)
+            out->channel_mask = config->offload_info.channel_mask;
+        else if (config->channel_mask)
+            out->channel_mask = config->channel_mask;
+        out->format = config->offload_info.format;
+        out->sample_rate = config->offload_info.sample_rate;
 
-#ifdef TINYHAL_COMPRESS_PLAYBACK
-    if (hw->type == e_stream_out_pcm) {
-        ret = do_init_out_pcm( out.pcm, config );
+        out->stream.set_callback = out_set_callback;
+        out->stream.pause = out_pause;
+        out->stream.resume = out_resume;
+        out->stream.drain = out_drain;
+        out->stream.flush = out_flush;
+
+        out->compr_config.codec->id =
+                get_snd_codec_id(config->offload_info.format);
+        out->compr_config.fragment_size = COMPRESS_OFFLOAD_FRAGMENT_SIZE;
+        out->compr_config.fragments = COMPRESS_OFFLOAD_NUM_FRAGMENTS;
+        out->compr_config.codec->sample_rate = config->offload_info.sample_rate;
+        out->compr_config.codec->bit_rate =
+                    config->offload_info.bit_rate;
+        out->compr_config.codec->ch_in =
+                audio_channel_count_from_out_mask(config->channel_mask);
+        out->compr_config.codec->ch_out = out->compr_config.codec->ch_in;
+
+        if (flags & AUDIO_OUTPUT_FLAG_NON_BLOCKING)
+            out->non_blocking = 1;
+
+        out->send_new_metadata = 1;
+        create_offload_callback_thread(out);
+        out->offload_state = OFFLOAD_STATE_IDLE;
+
+        ALOGV("%s: offloaded output offload_info version %04x bit rate %d",
+                __func__, config->offload_info.version,
+                config->offload_info.bit_rate);
+    } else if (out->flags & (AUDIO_OUTPUT_FLAG_DEEP_BUFFER)) {
+        out->usecase = USECASE_AUDIO_PLAYBACK_DEEP_BUFFER;
+        out->config = pcm_config_deep_buffer;
+        out->sample_rate = out->config.rate;
+        ALOGV("%s: use AUDIO_PLAYBACK_DEEP_BUFFER",__func__);
     } else {
-        ret = do_init_out_compress( out.compress, config );
-    }
-#else
-    ret = do_init_out_pcm( out.pcm, config );
-#endif
-
-    if (ret < 0) {
-        goto err_open;
+        out->usecase = USECASE_AUDIO_PLAYBACK;
+        out->sample_rate = out->config.rate;
     }
 
-    /* Update config with initial stream settings */
-    config->format = out.common->format;
-    config->channel_mask = out.common->channel_mask;
-    config->sample_rate = out.common->sample_rate;
+    if (flags & AUDIO_OUTPUT_FLAG_PRIMARY) {
+        if (adev->primary_output == NULL)
+            adev->primary_output = out;
+        else {
+            ALOGE("%s: Primary output is already opened", __func__);
+            ret = -EEXIST;
+            goto error_open;
+        }
+    }
 
-    *stream_out = &out.common->stream;
-    ALOGV("-adev_open_output_stream=%p", *stream_out);
+    /* Check if this usecase is already existing */
+    pthread_mutex_lock(&adev->lock);
+    if (get_usecase_from_id(adev, out->usecase) != NULL) {
+        ALOGE("%s: Usecase (%d) is already present", __func__, out->usecase);
+        pthread_mutex_unlock(&adev->lock);
+        ret = -EEXIST;
+        goto error_open;
+    }
+    pthread_mutex_unlock(&adev->lock);
+
+    out->stream.common.get_sample_rate = out_get_sample_rate;
+    out->stream.common.set_sample_rate = out_set_sample_rate;
+    out->stream.common.get_buffer_size = out_get_buffer_size;
+    out->stream.common.get_channels = out_get_channels;
+    out->stream.common.get_format = out_get_format;
+    out->stream.common.set_format = out_set_format;
+    out->stream.common.standby = out_standby;
+    out->stream.common.dump = out_dump;
+    out->stream.common.set_parameters = out_set_parameters;
+    out->stream.common.get_parameters = out_get_parameters;
+    out->stream.common.add_audio_effect = out_add_audio_effect;
+    out->stream.common.remove_audio_effect = out_remove_audio_effect;
+    out->stream.get_latency = out_get_latency;
+    out->stream.set_volume = out_set_volume;
+    out->stream.write = out_write;
+    out->stream.get_render_position = out_get_render_position;
+    out->stream.get_next_write_timestamp = out_get_next_write_timestamp;
+    out->stream.get_presentation_position = out_get_presentation_position;
+
+    out->standby = 1;
+    /* out->muted = false; by calloc() */
+    /* out->written = 0; by calloc() */
+
+    pthread_mutex_init(&out->lock, (const pthread_mutexattr_t *) NULL);
+    pthread_mutex_init(&out->pre_lock, (const pthread_mutexattr_t *) NULL);
+    pthread_cond_init(&out->cond, (const pthread_condattr_t *) NULL);
+
+    config->format = out->stream.common.get_format(&out->stream.common);
+    config->channel_mask = out->stream.common.get_channels(&out->stream.common);
+    config->sample_rate = out->stream.common.get_sample_rate(&out->stream.common);
+
+    out->is_fastmixer_affinity_set = false;
+
+    *stream_out = &out->stream;
+    ALOGV("%s: exit", __func__);
     return 0;
 
-err_open:
-    free(out.common);
+error_open:
+    free(out);
     *stream_out = NULL;
-err_fail:
-    ALOGV("-adev_open_output_stream (%d)", ret);
+    ALOGV("%s: exit: ret %d", __func__, ret);
     return ret;
 }
 
 static void adev_close_output_stream(struct audio_hw_device *dev,
                                      struct audio_stream_out *stream)
 {
-    struct stream_out_common *out = (struct stream_out_common *)stream;
-    ALOGV("adev_close_output_stream(%p)", stream);
-    (out->close)(stream);
+    struct stream_out *out = (struct stream_out *)stream;
+    struct audio_device *adev = out->dev;
+    (void)dev;
+
+    ALOGV("%s: enter", __func__);
+    out_standby(&stream->common);
+    if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+        destroy_offload_callback_thread(out);
+
+        if (out->compr_config.codec != NULL)
+            free(out->compr_config.codec);
+    }
+    pthread_cond_destroy(&out->cond);
+    pthread_mutex_destroy(&out->lock);
+    free(stream);
+    ALOGV("%s: exit", __func__);
 }
 
-static int adev_open_input_stream(struct audio_hw_device *dev,
-                                  audio_io_handle_t handle,
-                                  audio_devices_t devices,
-                                  struct audio_config *config,
-                                  struct audio_stream_in **stream_in
-#ifdef AUDIO_DEVICE_API_VERSION_3_0
-                                  , audio_input_flags_t flags,
-                                  const char *address,
-                                  audio_source_t source
-#endif
-                                  )
-{
-    struct audio_device *adev = (struct audio_device *)dev;
-    struct stream_in_pcm *in = NULL;
-    int ret;
-
-    ALOGV("+adev_open_input_stream");
-
-    *stream_in = NULL;
-
-    /* We don't open a config manager stream here because we don't yet
-     * know what input_source to use. Defer until Android sends us an
-     * input_source set_parameter()
-     */
-
-    in = (struct stream_in_pcm *)calloc(1, sizeof(struct stream_in_pcm));
-    if (!in) {
-        ret = -ENOMEM;
-        goto fail;
-    }
-
-    in->common.dev = adev;
-
-    devices &= AUDIO_DEVICE_IN_ALL;
-    ret = do_init_in_common(&in->common, config, devices);
-    if (ret < 0) {
-        goto fail;
-    }
-
-    ret = do_init_in_pcm(in, config);
-    if (ret < 0) {
-        goto fail;
-    }
-
-    *stream_in = &in->common.stream;
-    return 0;
-
-fail:
-    free(in);
-    ALOGV("-adev_open_input_stream (%d)", ret);
-    return ret;
-}
-
-static void adev_close_input_stream(struct audio_hw_device *dev,
-                                   struct audio_stream_in *stream)
-{
-    struct stream_in_common *in = (struct stream_in_common *)stream;
-    ALOGV("adev_close_input_stream(%p)", stream);
-    (in->close)(&stream->common);
-}
-
-/*********************************************************************
- * Voice trigger state machine
- *********************************************************************/
-
-static void do_voice_trigger_open_stream(struct audio_device *adev, const char *streamName)
-{
-    audio_devices_t mic_device;
-
-    adev->voice_trig_stream = get_named_stream(adev->cm, streamName);
-
-    if (adev->voice_trig_stream != NULL) {
-        if (adev->voice_trig_mic == 0) {
-            /* No mic specified, default to internal mic */
-            mic_device = AUDIO_DEVICE_IN_BUILTIN_MIC;
-        } else {
-            mic_device = adev->voice_trig_mic;
-        }
-
-        apply_route(adev->voice_trig_stream, mic_device);
-    }
-}
-
-static void do_voice_trigger_close_stream(struct audio_device *adev)
-{
-    if (adev->voice_trig_stream != NULL) {
-        apply_route(adev->voice_trig_stream, 0);
-        release_stream(adev->voice_trig_stream);
-        adev->voice_trig_stream == NULL;
-    }
-}
-
-static void voice_trigger_enable(struct audio_device *adev)
-{
-    pthread_mutex_lock(&adev->lock);
-
-    ALOGV("+voice_trigger_enable (%u)", adev->voice_st);
-
-    switch (adev->voice_st) {
-        case eVoiceNone:
-            break;
-
-        case eVoiceTriggerIdle:
-        case eVoiceTriggerFired:
-            do_voice_trigger_open_stream(adev, kVoiceTriggerStreamName);
-            adev->voice_st = eVoiceTriggerArmed;
-            break;
-
-        case eVoiceTriggerArmed:
-            break;
-
-        case eVoiceRecogIdle:
-            do_voice_trigger_open_stream(adev, kVoiceRecogStreamName);
-            adev->voice_st = eVoiceRecogArmed;
-            break;
-
-        case eVoiceRecogArmed:
-        case eVoiceRecogFired:
-        case eVoiceRecogReArm:
-            break;
-
-        case eVoiceRecogAudio:
-            adev->voice_st = eVoiceRecogReArm;
-            break;
-    }
-
-    ALOGV("-voice_trigger_enable (%u)", adev->voice_st);
-
-    pthread_mutex_unlock(&adev->lock);
-}
-
-static void voice_trigger_disable(struct audio_device *adev)
-{
-    pthread_mutex_lock(&adev->lock);
-
-    ALOGV("+voice_trigger_disable (%u)", adev->voice_st);
-
-    switch (adev->voice_st) {
-        case eVoiceNone:
-            break;
-
-        case eVoiceTriggerIdle:
-            break;
-
-        case eVoiceTriggerFired:
-        case eVoiceTriggerArmed:
-            do_voice_trigger_close_stream(adev);
-            adev->voice_st = eVoiceTriggerIdle;
-            break;
-
-        case eVoiceRecogIdle:
-            break;
-
-        case eVoiceRecogArmed:
-            do_voice_trigger_close_stream(adev);
-            adev->voice_st = eVoiceRecogIdle;
-            break;
-
-        case eVoiceRecogFired:
-        case eVoiceRecogAudio:
-            /* If a full trigger+audio stream has fired we must wait for the */
-            /* audio capture stage to end before disabling it                */
-            break;
-
-        case eVoiceRecogReArm:
-            /* See note on previous case */
-            adev->voice_st = eVoiceRecogAudio;
-            break;
-    }
-
-    ALOGV("-voice_trigger_disable (%u)", adev->voice_st);
-
-    pthread_mutex_unlock(&adev->lock);
-}
-
-static void voice_trigger_triggered(struct audio_device *adev)
-{
-    pthread_mutex_lock(&adev->lock);
-
-    ALOGV("+voice_trigger_triggered (%u)", adev->voice_st);
-
-    switch (adev->voice_st) {
-        case eVoiceNone:
-        case eVoiceTriggerIdle:
-        case eVoiceTriggerFired:
-            break;
-
-        case eVoiceTriggerArmed:
-            adev->voice_st = eVoiceTriggerFired;
-            break;
-
-        case eVoiceRecogIdle:
-        case eVoiceRecogFired:
-        case eVoiceRecogAudio:
-        case eVoiceRecogReArm:
-            break;
-
-        case eVoiceRecogArmed:
-            adev->voice_st = eVoiceRecogFired;
-            break;
-    }
-
-    ALOGV("-voice_trigger_triggered (%u)", adev->voice_st);
-
-    pthread_mutex_unlock(&adev->lock);
-}
-
-static void voice_trigger_audio_started_locked(struct audio_device *adev)
-{
-    ALOGV("+voice_trigger_audio_started (%u)", adev->voice_st);
-
-    switch (adev->voice_st) {
-        case eVoiceNone:
-        case eVoiceTriggerIdle:
-        case eVoiceTriggerArmed:
-        case eVoiceTriggerFired:
-            break;
-
-        case eVoiceRecogIdle:
-        case eVoiceRecogArmed:
-            break;
-
-        case eVoiceRecogFired:
-            adev->voice_st = eVoiceRecogAudio;
-            break;
-
-        case eVoiceRecogAudio:
-        case eVoiceRecogReArm:
-            break;
-    }
-
-    ALOGV("-voice_trigger_audio_started (%d)", adev->voice_st);
-}
-
-static void voice_trigger_audio_ended_locked(struct audio_device *adev)
-{
-    ALOGV("+voice_trigger_audio_ended (%u)", adev->voice_st);
-
-    switch (adev->voice_st) {
-        case eVoiceNone:
-        case eVoiceTriggerIdle:
-        case eVoiceTriggerArmed:
-        case eVoiceTriggerFired:
-            break;
-
-        case eVoiceRecogIdle:
-        case eVoiceRecogArmed:
-        case eVoiceRecogFired:
-            break;
-
-        case eVoiceRecogAudio:
-            do_voice_trigger_close_stream(adev);
-            adev->voice_st = eVoiceRecogIdle;
-            break;
-
-        case eVoiceRecogReArm:
-            adev->voice_st = eVoiceRecogArmed;
-            break;
-    }
-
-    ALOGV("-voice_trigger_audio_ended (%d)", adev->voice_st);
-}
-
-static void voice_trigger_set_params(struct audio_device *adev, struct str_parms *parms)
-{
-    int ret;
-    char value[32];
-
-    ret = str_parms_get_str(parms, "voice_trigger_mic", value, sizeof(value));
-    if (ret >= 0) {
-        adev->voice_trig_mic = atoi(value);
-    }
-
-    ret = str_parms_get_str(parms, "voice_trigger", value, sizeof(value));
-    if (ret >= 0) {
-        if (strcmp(value, "2") == 0) {
-            voice_trigger_triggered(adev);
-        } else if (strcmp(value, "1") == 0) {
-            voice_trigger_enable(adev);
-        } else if (strcmp(value, "0") == 0) {
-            voice_trigger_disable(adev);
-        }
-    }
-}
-
-static const char *voice_trigger_audio_stream_name(struct audio_device *adev)
-{
-    /* no need to lock adev because we only need the instantaneous state */
-    switch (adev->voice_st) {
-        case eVoiceNone:
-        case eVoiceTriggerIdle:
-        case eVoiceTriggerArmed:
-        case eVoiceTriggerFired:
-            /* trigger-only hardware, so attempt to open a specific
-             * voice recognition stream
-             */
-            return kVoiceRecogStreamName;
-
-        case eVoiceRecogIdle:
-        case eVoiceRecogArmed:
-        case eVoiceRecogReArm:
-            /* recognizer has not fired, do not open the dedicated audio stream
-             * because there will not be any audio available from it. Fall
-             * back to just opening the normal recording path
-             */
-            return NULL;
-
-        case eVoiceRecogFired:
-            /* recognizer has fired so audio will be available from it */
-            return kVoiceRecogStreamName;
-
-        case eVoiceRecogAudio:
-            /* should never get here, state says audio stream is already open */
-            return NULL;
-
-        default:
-            /* stops compiler warning */
-            return NULL;
-    }
-}
-
-static void voice_trigger_init(struct audio_device *adev)
-{
-    if (is_named_stream_defined(adev->cm, kVoiceRecogStreamName)) {
-        ALOGV("Voice recognition mode");
-        adev->voice_st = eVoiceRecogIdle;
-    } else if (is_named_stream_defined(adev->cm, kVoiceTriggerStreamName)) {
-        ALOGV("Voice trigger mode");
-        adev->voice_st = eVoiceTriggerIdle;
-    } else {
-        ALOGV("no voice recognition available");
-        adev->voice_st = eVoiceNone;
-    }
-}
-
-/*********************************************************************
- * Global API functions
- *********************************************************************/
 static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
 {
     struct audio_device *adev = (struct audio_device *)dev;
     struct str_parms *parms;
     char *str;
     char value[32];
+    int val;
+    int ret;
 
-    ALOGW("adev_set_parameters '%s'", kvpairs);
+    ALOGV("%s: enter: %s", __func__, kvpairs);
 
     parms = str_parms_create_str(kvpairs);
-    if (parms) {
-        voice_trigger_set_params(adev, parms);
-        str_parms_destroy(parms);
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_TTY_MODE, value, sizeof(value));
+    if (ret >= 0) {
+        int tty_mode;
+
+        if (strcmp(value, AUDIO_PARAMETER_VALUE_TTY_OFF) == 0)
+            tty_mode = TTY_MODE_OFF;
+        else if (strcmp(value, AUDIO_PARAMETER_VALUE_TTY_VCO) == 0)
+            tty_mode = TTY_MODE_VCO;
+        else if (strcmp(value, AUDIO_PARAMETER_VALUE_TTY_HCO) == 0)
+            tty_mode = TTY_MODE_HCO;
+        else if (strcmp(value, AUDIO_PARAMETER_VALUE_TTY_FULL) == 0)
+            tty_mode = TTY_MODE_FULL;
+        else
+            return -EINVAL;
+
+        pthread_mutex_lock(&adev->lock);
+        if (tty_mode != adev->tty_mode) {
+            adev->tty_mode = tty_mode;
+            if (adev->in_call)
+                select_devices(adev, USECASE_VOICE_CALL);
+        }
+        pthread_mutex_unlock(&adev->lock);
     }
 
-    if (adev->global_stream != NULL)
-        stream_invoke_usecases(adev->global_stream, kvpairs);
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_BT_NREC, value, sizeof(value));
+    if (ret >= 0) {
+        /* When set to false, HAL should disable EC and NS
+         * But it is currently not supported.
+         */
+        if (strcmp(value, AUDIO_PARAMETER_VALUE_ON) == 0)
+            adev->bluetooth_nrec = true;
+        else
+            adev->bluetooth_nrec = false;
+    }
 
-    return 0;
+    ret = str_parms_get_str(parms, "screen_state", value, sizeof(value));
+    if (ret >= 0) {
+        if (strcmp(value, AUDIO_PARAMETER_VALUE_ON) == 0)
+            adev->screen_off = false;
+        else
+            adev->screen_off = true;
+    }
+
+    ret = str_parms_get_int(parms, "rotation", &val);
+    if (ret >= 0) {
+        bool reverse_speakers = false;
+        switch(val) {
+        /* FIXME: note that the code below assumes that the speakers are in the correct placement
+             relative to the user when the device is rotated 90deg from its default rotation. This
+             assumption is device-specific, not platform-specific like this code. */
+        case 270:
+            reverse_speakers = true;
+            break;
+        case 0:
+        case 90:
+        case 180:
+            break;
+        default:
+            ALOGE("%s: unexpected rotation of %d", __func__, val);
+        }
+        pthread_mutex_lock(&adev->lock);
+        if (adev->speaker_lr_swap != reverse_speakers) {
+            adev->speaker_lr_swap = reverse_speakers;
+            /* only update the selected device if there is active pcm playback */
+            struct audio_usecase *usecase;
+            struct listnode *node;
+            list_for_each(node, &adev->usecase_list) {
+                usecase = node_to_item(node, struct audio_usecase, adev_list_node);
+                if (usecase->type == PCM_PLAYBACK) {
+                    select_devices(adev, usecase->id);
+                    if (adev->htc_acoustic_spk_reverse)
+                        adev->htc_acoustic_spk_reverse(adev->speaker_lr_swap);
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&adev->lock);
+    }
+
+    str_parms_destroy(parms);
+
+    if (ret > 0)
+        ret = 0;
+
+    ALOGV("%s: exit with code(%d)", __func__, ret);
+    return ret;
 }
 
-static char * adev_get_parameters(const struct audio_hw_device *dev,
-                                  const char *keys)
+static char* adev_get_parameters(const struct audio_hw_device *dev,
+                                 const char *keys)
 {
     (void)dev;
     (void)keys;
+
     return strdup("");
 }
 
 static int adev_init_check(const struct audio_hw_device *dev)
 {
     (void)dev;
+
     return 0;
 }
 
 static int adev_set_voice_volume(struct audio_hw_device *dev, float volume)
 {
-    (void)dev;
-    (void)volume;
-    return -ENOSYS;
+    int ret = 0;
+    struct audio_device *adev = (struct audio_device *)dev;
+    pthread_mutex_lock(&adev->lock);
+    /* cache volume */
+    adev->voice_volume = volume;
+    ret = set_voice_volume_l(adev, adev->voice_volume);
+    pthread_mutex_unlock(&adev->lock);
+    return ret;
 }
 
 static int adev_set_master_volume(struct audio_hw_device *dev, float volume)
 {
     (void)dev;
     (void)volume;
+
+    return -ENOSYS;
+}
+
+static int adev_get_master_volume(struct audio_hw_device *dev,
+                                  float *volume)
+{
+    (void)dev;
+    (void)volume;
+
+    return -ENOSYS;
+}
+
+static int adev_set_master_mute(struct audio_hw_device *dev, bool muted)
+{
+    (void)dev;
+    (void)muted;
+
+    return -ENOSYS;
+}
+
+static int adev_get_master_mute(struct audio_hw_device *dev, bool *muted)
+{
+    (void)dev;
+    (void)muted;
+
     return -ENOSYS;
 }
 
 static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
 {
-    (void)dev;
-    (void)mode;
+    struct audio_device *adev = (struct audio_device *)dev;
+
+    pthread_mutex_lock(&adev->lock);
+    if (adev->mode != mode) {
+        ALOGI("%s mode = %d", __func__, mode);
+        adev->mode = mode;
+        pthread_mutex_lock(&adev->tfa9895_lock);
+        adev->tfa9895_mode_change |= 0x1;
+        pthread_mutex_unlock(&adev->tfa9895_lock);
+    }
+    pthread_mutex_unlock(&adev->lock);
     return 0;
 }
 
 static int adev_set_mic_mute(struct audio_hw_device *dev, bool state)
 {
     struct audio_device *adev = (struct audio_device *)dev;
+    int err = 0;
 
     pthread_mutex_lock(&adev->lock);
     adev->mic_mute = state;
-    pthread_mutex_unlock(&adev->lock);
 
-    return 0;
+    if (adev->mode == AUDIO_MODE_IN_CALL) {
+        /* TODO */
+    }
+
+    pthread_mutex_unlock(&adev->lock);
+    return err;
 }
 
 static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
@@ -2846,86 +4264,516 @@ static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
 static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev,
                                          const struct audio_config *config)
 {
-    size_t s = IN_PERIOD_SIZE_DEFAULT *
-                    audio_bytes_per_sample(config->format) *
-                    popcount(config->channel_mask);
+    (void)dev;
 
-    if (s > IN_COMPRESS_BUFFER_SIZE_DEFAULT) {
-        s = IN_COMPRESS_BUFFER_SIZE_DEFAULT;
+    /* NOTE: we default to built in mic which may cause a mismatch between what we
+     * report here and the actual buffer size
+     */
+    return get_input_buffer_size(config->sample_rate,
+                                 config->format,
+                                 audio_channel_count_from_in_mask(config->channel_mask),
+                                 PCM_CAPTURE /* usecase_type */,
+                                 AUDIO_DEVICE_IN_BUILTIN_MIC);
+}
+
+static int adev_open_input_stream(struct audio_hw_device *dev,
+                                  audio_io_handle_t handle __unused,
+                                  audio_devices_t devices,
+                                  struct audio_config *config,
+                                  struct audio_stream_in **stream_in,
+                                  audio_input_flags_t flags,
+                                  const char *address __unused,
+                                  audio_source_t source)
+{
+    struct audio_device *adev = (struct audio_device *)dev;
+    struct stream_in *in;
+    struct pcm_device_profile *pcm_profile;
+
+    ALOGV("%s: enter", __func__);
+
+    *stream_in = NULL;
+    if (check_input_parameters(config->sample_rate, config->format,
+                               audio_channel_count_from_in_mask(config->channel_mask)) != 0)
+        return -EINVAL;
+
+    usecase_type_t usecase_type = source == AUDIO_SOURCE_HOTWORD ?
+                PCM_HOTWORD_STREAMING : flags & AUDIO_INPUT_FLAG_FAST ?
+                        PCM_CAPTURE_LOW_LATENCY : PCM_CAPTURE;
+    pcm_profile = get_pcm_device(usecase_type, devices);
+    if (pcm_profile == NULL && usecase_type == PCM_CAPTURE_LOW_LATENCY) {
+        // a low latency profile may not exist for that device, fall back
+        // to regular capture. the MixerThread automatically changes
+        // to non-fast capture based on the buffer size.
+        flags &= ~AUDIO_INPUT_FLAG_FAST;
+        usecase_type = PCM_CAPTURE;
+        pcm_profile = get_pcm_device(usecase_type, devices);
+    }
+    if (pcm_profile == NULL)
+        return -EINVAL;
+
+    in = (struct stream_in *)calloc(1, sizeof(struct stream_in));
+
+    in->stream.common.get_sample_rate = in_get_sample_rate;
+    in->stream.common.set_sample_rate = in_set_sample_rate;
+    in->stream.common.get_buffer_size = in_get_buffer_size;
+    in->stream.common.get_channels = in_get_channels;
+    in->stream.common.get_format = in_get_format;
+    in->stream.common.set_format = in_set_format;
+    in->stream.common.standby = in_standby;
+    in->stream.common.dump = in_dump;
+    in->stream.common.set_parameters = in_set_parameters;
+    in->stream.common.get_parameters = in_get_parameters;
+    in->stream.common.add_audio_effect = in_add_audio_effect;
+    in->stream.common.remove_audio_effect = in_remove_audio_effect;
+    in->stream.set_gain = in_set_gain;
+    in->stream.read = in_read;
+    in->stream.get_input_frames_lost = in_get_input_frames_lost;
+
+    in->devices = devices;
+    in->source = source;
+    in->dev = adev;
+    in->standby = 1;
+    in->main_channels = config->channel_mask;
+    in->requested_rate = config->sample_rate;
+    if (config->sample_rate != CAPTURE_DEFAULT_SAMPLING_RATE)
+        flags = flags & ~AUDIO_INPUT_FLAG_FAST;
+    in->input_flags = flags;
+    /* HW codec is limited to default channels. No need to update with
+     * requested channels */
+    in->config = pcm_profile->config;
+
+    /* Update config params with the requested sample rate and channels */
+    if (source == AUDIO_SOURCE_HOTWORD) {
+        in->usecase = USECASE_AUDIO_CAPTURE_HOTWORD;
+    } else {
+        in->usecase = USECASE_AUDIO_CAPTURE;
+    }
+    in->usecase_type = usecase_type;
+
+    pthread_mutex_init(&in->lock, (const pthread_mutexattr_t *) NULL);
+    pthread_mutex_init(&in->pre_lock, (const pthread_mutexattr_t *) NULL);
+
+    in->is_fastcapture_affinity_set = false;
+
+    *stream_in = &in->stream;
+    ALOGV("%s: exit", __func__);
+    return 0;
+}
+
+static void adev_close_input_stream(struct audio_hw_device *dev,
+                                    struct audio_stream_in *stream)
+{
+    struct audio_device *adev = (struct audio_device *)dev;
+    struct stream_in *in = (struct stream_in*)stream;
+    ALOGV("%s", __func__);
+
+    /* prevent concurrent out_set_parameters, or out_write from standby */
+    pthread_mutex_lock(&adev->lock_inputs);
+
+#ifdef PREPROCESSING_ENABLED
+    int i;
+
+    for (i=0; i<in->num_preprocessors; i++) {
+        free(in->preprocessors[i].channel_configs);
     }
 
-    return s;
+    if (in->read_buf) {
+        free(in->read_buf);
+        in->read_buf = NULL;
+    }
+
+    if (in->proc_buf_in) {
+        free(in->proc_buf_in);
+        in->proc_buf_in = NULL;
+    }
+
+    if (in->proc_buf_out) {
+        free(in->proc_buf_out);
+        in->proc_buf_out = NULL;
+    }
+
+    if (in->ref_buf) {
+        free(in->ref_buf);
+        in->ref_buf = NULL;
+    }
+
+    if (in->resampler) {
+        release_resampler(in->resampler);
+        in->resampler = NULL;
+    }
+#endif
+
+    in_standby_l(in);
+    free(stream);
+
+    pthread_mutex_unlock(&adev->lock_inputs);
+
+    return;
 }
 
 static int adev_dump(const audio_hw_device_t *device, int fd)
 {
     (void)device;
     (void)fd;
+
     return 0;
 }
 
 static int adev_close(hw_device_t *device)
 {
     struct audio_device *adev = (struct audio_device *)device;
-
-    free_audio_config(adev->cm);
-
+    audio_device_ref_count--;
+    free(adev->snd_dev_ref_cnt);
+    free_mixer_list(adev);
     free(device);
     return 0;
 }
 
-static int adev_open(const hw_module_t* module, const char* name,
-                     hw_device_t** device)
+static void *dummybuf_thread(void *context)
+{
+    ALOGV("%s: enter", __func__);
+    pthread_detach(pthread_self());
+    struct audio_device *adev = (struct audio_device *)context;
+    struct pcm_config config;
+    struct mixer *mixer = NULL;
+    struct mixer_ctl *ctl;
+    unsigned char *data = NULL;
+    struct pcm *pcm = NULL;
+    struct pcm_device_profile *profile = NULL;
+    audio_devices_t dummybuf_thread_devices = adev->dummybuf_thread_devices;
+
+    pthread_mutex_lock(&adev->dummybuf_thread_lock);
+
+    memset(&config, 0, sizeof(struct pcm_config));
+
+    profile = &pcm_device_playback;
+
+    memcpy(&config, &profile->config, sizeof(struct pcm_config));
+    /* Use large value for stop_threshold so that automatic
+       trigger for stop is avoided, when this thread fails to write data */
+    config.stop_threshold = INT_MAX/2;
+    pcm = pcm_open(profile->card, profile->id,
+                   (PCM_OUT | PCM_MONOTONIC), &config);
+    if (pcm != NULL && !pcm_is_ready(pcm)) {
+        ALOGE("pcm_open: card=%d, id=%d is not ready", profile->card, profile->id);
+        pcm_close(pcm);
+        pcm = NULL;
+    } else {
+        ALOGV("pcm_open: card=%d, id=%d", profile->card, profile->id);
+    }
+
+    mixer = mixer_open(profile->card);
+    if (mixer) {
+        if (dummybuf_thread_devices == AUDIO_DEVICE_OUT_WIRED_HEADPHONE) {
+            ctl = mixer_get_ctl_by_name(mixer, MIXER_CTL_HEADPHONE_JACK_SWITCH);
+            if (ctl != NULL)
+                mixer_ctl_set_value(ctl, 0, 1);
+            else {
+                ALOGE("Invalid mixer control: name(%s): skip dummy thread", MIXER_CTL_HEADPHONE_JACK_SWITCH);
+                goto exit;
+            }
+
+            ctl = mixer_get_ctl_by_name(mixer, MIXER_CTL_CODEC_VMIXER_CODEC_SWITCH);
+            if (ctl != NULL)
+                mixer_ctl_set_value(ctl, 0, 1);
+            else {
+                ALOGE("Invalid mixer control: name(%s): skip dummy thread", MIXER_CTL_CODEC_VMIXER_CODEC_SWITCH);
+                goto exit;
+            }
+        } else {
+            ctl = mixer_get_ctl_by_name(mixer, MIXER_CTL_SPK_VMIXER_SPK_SWITCH);
+            if (ctl != NULL)
+                mixer_ctl_set_value(ctl, 0, 1);
+            else {
+                ALOGE("Invalid mixer control: name(%s): skip dummy thread", MIXER_CTL_SPK_VMIXER_SPK_SWITCH);
+                goto exit;
+            }
+        }
+    }
+
+    while (1) {
+        if (pcm) {
+            if (data == NULL)
+                data = (unsigned char *)calloc(DEEP_BUFFER_OUTPUT_PERIOD_SIZE * 8,
+                            sizeof(unsigned char));
+            if (data) {
+                pcm_write(pcm, (void *)data, DEEP_BUFFER_OUTPUT_PERIOD_SIZE * 8);
+                adev->dummybuf_thread_active = 1;
+            } else {
+                ALOGV("%s: cant open a buffer, retry to open it", __func__);
+            }
+        } else {
+            ALOGV("%s: cant open a output deep stream, retry to open it", __func__);
+            pcm = pcm_open(profile->card, profile->id,
+                   (PCM_OUT | PCM_MONOTONIC), &config);
+            if (pcm != NULL && !pcm_is_ready(pcm)) {
+                ALOGE("pcm_open: card=%d, id=%d is not ready", profile->card, profile->id);
+                pcm_close(pcm);
+                pcm = NULL;
+            } else {
+                ALOGV("pcm_open: card=%d, id=%d", profile->card, profile->id);
+            }
+        }
+
+        if (adev->dummybuf_thread_cancel || adev->dummybuf_thread_timeout-- <= 0) {
+            adev->dummybuf_thread_cancel = 0;
+            break;
+        }
+
+        pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+        usleep(3000);
+        pthread_mutex_lock(&adev->dummybuf_thread_lock);
+    }
+
+exit:
+    adev->dummybuf_thread_active = 0;
+    if (mixer) {
+        if (dummybuf_thread_devices == AUDIO_DEVICE_OUT_WIRED_HEADPHONE) {
+            ctl = mixer_get_ctl_by_name(mixer, MIXER_CTL_HEADPHONE_JACK_SWITCH);
+            if (ctl != NULL)
+                mixer_ctl_set_value(ctl, 0, 0);
+            ctl = mixer_get_ctl_by_name(mixer, MIXER_CTL_CODEC_VMIXER_CODEC_SWITCH);
+            if (ctl != NULL)
+                mixer_ctl_set_value(ctl, 0, 0);
+        } else {
+            ctl = mixer_get_ctl_by_name(mixer, MIXER_CTL_SPK_VMIXER_SPK_SWITCH);
+            if (ctl != NULL)
+                mixer_ctl_set_value(ctl, 0, 0);
+        }
+        mixer_close(mixer);
+    }
+    if (pcm) {
+        pcm_close(pcm);
+        pcm = NULL;
+    }
+    pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+
+    if (data)
+        free(data);
+
+    return NULL;
+}
+
+static void dummybuf_thread_open(struct audio_device *adev)
+{
+    adev->dummybuf_thread_timeout = 6000; /* in 18 sec */
+    adev->dummybuf_thread_cancel = 0;
+    adev->dummybuf_thread_active = 0;
+    pthread_mutex_init(&adev->dummybuf_thread_lock, (const pthread_mutexattr_t *) NULL);
+    if (!adev->dummybuf_thread)
+        pthread_create(&adev->dummybuf_thread, (const pthread_attr_t *) NULL, dummybuf_thread, adev);
+}
+
+static void dummybuf_thread_close(struct audio_device *adev)
+{
+    ALOGV("%s: enter", __func__);
+    int retry_cnt = 20;
+
+    if (adev->dummybuf_thread == 0)
+        return;
+
+    pthread_mutex_lock(&adev->dummybuf_thread_lock);
+    adev->dummybuf_thread_cancel = 1;
+    pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+
+    while (retry_cnt > 0) {
+        pthread_mutex_lock(&adev->dummybuf_thread_lock);
+        if (adev->dummybuf_thread_active == 0) {
+            pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+            break;
+        }
+        pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+        retry_cnt--;
+        usleep(1000);
+    }
+
+    pthread_join(adev->dummybuf_thread, (void **) NULL);
+    pthread_mutex_destroy(&adev->dummybuf_thread_lock);
+    adev->dummybuf_thread = 0;
+}
+
+/* This returns true if the input parameter looks at all plausible as a low latency period size,
+ * or false otherwise.  A return value of true doesn't mean the value is guaranteed to work,
+ * just that it _might_ work.
+ */
+static bool period_size_is_plausible_for_low_latency(int period_size)
+{
+    switch (period_size) {
+    case 64:
+    case 96:
+    case 128:
+    case 192:
+    case 256:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int adev_open(const hw_module_t *module, const char *name,
+                     hw_device_t **device)
 {
     struct audio_device *adev;
-    int ret;
+    int retry_count = 0;
 
-    if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0)
-        return -EINVAL;
+    ALOGV("%s: enter", __func__);
+    if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0) return -EINVAL;
 
     adev = calloc(1, sizeof(struct audio_device));
-    if (!adev)
-        return -ENOMEM;
 
-    adev->hw_device.common.tag = HARDWARE_DEVICE_TAG;
-    adev->hw_device.common.version = AUDIO_DEVICE_API_VERSION_2_0;
-    adev->hw_device.common.module = (struct hw_module_t *) module;
-    adev->hw_device.common.close = adev_close;
+    adev->device.common.tag = HARDWARE_DEVICE_TAG;
+    adev->device.common.version = AUDIO_DEVICE_API_VERSION_2_0;
+    adev->device.common.module = (struct hw_module_t *)module;
+    adev->device.common.close = adev_close;
 
-    adev->hw_device.init_check = adev_init_check;
-    adev->hw_device.set_voice_volume = adev_set_voice_volume;
-    adev->hw_device.set_master_volume = adev_set_master_volume;
-    adev->hw_device.set_mode = adev_set_mode;
-    adev->hw_device.set_mic_mute = adev_set_mic_mute;
-    adev->hw_device.get_mic_mute = adev_get_mic_mute;
-    adev->hw_device.set_parameters = adev_set_parameters;
-    adev->hw_device.get_parameters = adev_get_parameters;
-    adev->hw_device.get_input_buffer_size = adev_get_input_buffer_size;
-    adev->hw_device.open_output_stream = adev_open_output_stream;
-    adev->hw_device.close_output_stream = adev_close_output_stream;
-    adev->hw_device.open_input_stream = adev_open_input_stream;
-    adev->hw_device.close_input_stream = adev_close_input_stream;
-    adev->hw_device.dump = adev_dump;
+    adev->device.init_check = adev_init_check;
+    adev->device.set_voice_volume = adev_set_voice_volume;
+    adev->device.set_master_volume = adev_set_master_volume;
+    adev->device.get_master_volume = adev_get_master_volume;
+    adev->device.set_master_mute = adev_set_master_mute;
+    adev->device.get_master_mute = adev_get_master_mute;
+    adev->device.set_mode = adev_set_mode;
+    adev->device.set_mic_mute = adev_set_mic_mute;
+    adev->device.get_mic_mute = adev_get_mic_mute;
+    adev->device.set_parameters = adev_set_parameters;
+    adev->device.get_parameters = adev_get_parameters;
+    adev->device.get_input_buffer_size = adev_get_input_buffer_size;
+    adev->device.open_output_stream = adev_open_output_stream;
+    adev->device.close_output_stream = adev_close_output_stream;
+    adev->device.open_input_stream = adev_open_input_stream;
+    adev->device.close_input_stream = adev_close_input_stream;
+    adev->device.dump = adev_dump;
 
-    adev->cm = init_audio_config();
-    if (!adev->cm) {
-        ret = -EINVAL;
-        goto fail;
+    /* Set the default route before the PCM stream is opened */
+    adev->mode = AUDIO_MODE_NORMAL;
+    adev->active_input = NULL;
+    adev->primary_output = NULL;
+    adev->voice_volume = 1.0f;
+    adev->tty_mode = TTY_MODE_OFF;
+    adev->bluetooth_nrec = true;
+    adev->in_call = false;
+    /* adev->cur_hdmi_channels = 0;  by calloc() */
+    adev->snd_dev_ref_cnt = calloc(SND_DEVICE_MAX, sizeof(int));
+
+    adev->dualmic_config = DUALMIC_CONFIG_NONE;
+    adev->ns_in_voice_rec = false;
+
+    list_init(&adev->usecase_list);
+
+    if (mixer_init(adev) != 0) {
+        free(adev->snd_dev_ref_cnt);
+        free(adev);
+        ALOGE("%s: Failed to init, aborting.", __func__);
+        *device = NULL;
+        return -EINVAL;
     }
 
-    adev->global_stream = get_named_stream(adev->cm, "global");
-    voice_trigger_init(adev);
+    if (access(OFFLOAD_FX_LIBRARY_PATH, R_OK) == 0) {
+        adev->offload_fx_lib = dlopen(OFFLOAD_FX_LIBRARY_PATH, RTLD_NOW);
+        if (adev->offload_fx_lib == NULL) {
+            ALOGE("%s: DLOPEN failed for %s", __func__, OFFLOAD_FX_LIBRARY_PATH);
+        } else {
+            ALOGV("%s: DLOPEN successful for %s", __func__, OFFLOAD_FX_LIBRARY_PATH);
+            adev->offload_fx_start_output =
+                        (int (*)(audio_io_handle_t))dlsym(adev->offload_fx_lib,
+                                                        "visualizer_hal_start_output");
+            adev->offload_fx_stop_output =
+                        (int (*)(audio_io_handle_t))dlsym(adev->offload_fx_lib,
+                                                        "visualizer_hal_stop_output");
+        }
+    }
 
-    *device = &adev->hw_device.common;
+    if (access(HTC_ACOUSTIC_LIBRARY_PATH, R_OK) == 0) {
+        adev->htc_acoustic_lib = dlopen(HTC_ACOUSTIC_LIBRARY_PATH, RTLD_NOW);
+        if (adev->htc_acoustic_lib == NULL) {
+            ALOGE("%s: DLOPEN failed for %s", __func__, HTC_ACOUSTIC_LIBRARY_PATH);
+        } else {
+            ALOGV("%s: DLOPEN successful for %s", __func__, HTC_ACOUSTIC_LIBRARY_PATH);
+            adev->htc_acoustic_init_rt5506 =
+                        (int (*)())dlsym(adev->htc_acoustic_lib,
+                                                        "init_rt5506");
+            adev->htc_acoustic_set_rt5506_amp =
+                        (int (*)(int, int))dlsym(adev->htc_acoustic_lib,
+                                                        "set_rt5506_amp");
+            adev->htc_acoustic_set_amp_mode =
+                        (int (*)(int , int, int, int, bool))dlsym(adev->htc_acoustic_lib,
+                                                        "set_amp_mode");
+            adev->htc_acoustic_spk_reverse =
+                        (int (*)(bool))dlsym(adev->htc_acoustic_lib,
+                                                        "spk_reverse");
+            if (adev->htc_acoustic_spk_reverse)
+                adev->htc_acoustic_spk_reverse(adev->speaker_lr_swap);
+        }
+    }
+
+   
+ 
+
+    *device = &adev->device.common;
+
+    if (adev->htc_acoustic_init_rt5506 != NULL)
+        adev->htc_acoustic_init_rt5506();
+
+    if (audio_device_ref_count == 0) {
+        /* For HS GPIO initial config */
+        adev->dummybuf_thread_devices = AUDIO_DEVICE_OUT_WIRED_HEADPHONE;
+        dummybuf_thread_open(adev);
+        retry_count = RETRY_NUMBER;
+        while (retry_count-- > 0) {
+            pthread_mutex_lock(&adev->dummybuf_thread_lock);
+            if (adev->dummybuf_thread_active != 0) {
+                pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+                break;
+            }
+            pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+            usleep(10000);
+        }
+        dummybuf_thread_close(adev);
+
+        /* For NXP DSP config */
+        if (adev->htc_acoustic_set_amp_mode) {
+            pthread_t th;
+            adev->dummybuf_thread_devices = AUDIO_DEVICE_OUT_SPEAKER;
+            dummybuf_thread_open(adev);
+            pthread_mutex_lock(&adev->dummybuf_thread_lock);
+            retry_count = RETRY_NUMBER;
+            while (retry_count-- > 0) {
+                if (adev->dummybuf_thread_active) {
+                    break;
+                }
+                pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+                usleep(10000);
+                pthread_mutex_lock(&adev->dummybuf_thread_lock);
+            }
+            if (adev->dummybuf_thread_active) {
+                usleep(10000); /* tfa9895 spk amp need more than 1ms i2s signal before giving dsp related i2c commands*/
+                if (pthread_create(&th, NULL, tfa9895_config_thread, (void* )adev) != 0) {
+                    ALOGE("@@##THREAD_FADE_IN_UPPER_SPEAKER thread create fail");
+                }
+            }
+            pthread_mutex_unlock(&adev->dummybuf_thread_lock);
+            /* Then, dummybuf_thread_close() is called by tfa9895_config_thread() */
+        }
+    }
+    audio_device_ref_count++;
+
+    char value[PROPERTY_VALUE_MAX];
+    if (property_get("audio_hal.period_size", value, NULL) > 0) {
+        int trial = atoi(value);
+        if (period_size_is_plausible_for_low_latency(trial)) {
+
+            pcm_device_playback.config.period_size = trial;
+            pcm_device_playback.config.start_threshold =
+                    PLAYBACK_START_THRESHOLD(trial, PLAYBACK_PERIOD_COUNT);
+            pcm_device_playback.config.stop_threshold =
+                    PLAYBACK_STOP_THRESHOLD(trial, PLAYBACK_PERIOD_COUNT);
+
+            pcm_device_capture_low_latency.config.period_size = trial;
+        }
+    }
+
+    ALOGV("%s: exit", __func__);
     return 0;
-
-fail:
-    if (adev->cm) {
-        free_audio_config(adev->cm);
-    }
-
-    free(adev);
-    return ret;
 }
 
 static struct hw_module_methods_t hal_module_methods = {
@@ -2938,8 +4786,17 @@ struct audio_module HAL_MODULE_INFO_SYM = {
         .module_api_version = AUDIO_MODULE_API_VERSION_0_1,
         .hal_api_version = HARDWARE_HAL_API_VERSION,
         .id = AUDIO_HARDWARE_MODULE_ID,
-        .name = "TinyHAL",
-        .author = "Richard Fitzgerald <rf@opensource.wolfsonmicro.com>",
+        .name = "NVIDIA Tegra Audio HAL",
+        .author = "The Android Open Source Project",
         .methods = &hal_module_methods,
     },
+};
+void _ZN7android8MonoPipeC1Ejjb(size_t reqFrames, unsigned format_old, bool writeCanBlock)
+{
+
+}
+
+unsigned _ZN7android16Format_from_SR_CEjj(unsigned sampleRate, unsigned channelCount)
+{
+    return 0;
 };
