@@ -84,7 +84,6 @@ TARGET_THERMALHAL_VARIANT := tegra
 BOARD_USES_GENERIC_AUDIO := false
 BOARD_USES_ALSA_AUDIO := true
 
-
 # Bluetooth
 BOARD_HAVE_BLUETOOTH := true
 BOARD_HAVE_BLUETOOTH_BCM := true
@@ -155,9 +154,12 @@ BOARD_SEPOLICY_DIRS += device/xiaomi/mocha/sepolicy/common \
 # Zygote whitelist extra paths
 ZYGOTE_WHITELIST_PATH_EXTRA := \"/dev/nvhost-ctrl\",\"/dev/nvmap\",
 
-
 # Disable dex pre-opt
 WITH_DEXPREOPT := false
+
+# Shim libs
+TARGET_LD_SHIM_LIBS := \
+        /system/lib/hw/audio.primary.tegra.so|libshim_audio.so
 
 # HIDL Manifest
 DEVICE_MANIFEST_FILE := $(LOCAL_PATH)/configs/manifest.xml
