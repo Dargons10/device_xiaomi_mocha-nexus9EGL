@@ -43,3 +43,6 @@ LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE := libshim_audio
 LOCAL_C_INCLUDES := \
     external/icu/icu4c/source/common
+
+LOCAL_MODULE_TAGS := optional
+include $(BUILD_SHARED_LIBRARY)
