@@ -220,7 +220,8 @@ $(call inherit-product-if-exists, vendor/xiaomi/mocha/consolemode-blobs.mk)
 # Graphics shim
 PRODUCT_PACKAGES += libs \
                     libshim_zw \
-                    libshim_atomic
+                    libshim_atomic \
+                    libshim_audio
 
 # HIDL HALs
 $(call inherit-product, device/xiaomi/mocha/hidl.mk)
